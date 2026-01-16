@@ -1,0 +1,25 @@
+{
+  "name": "sdpuppy7",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "node ./index.js",
+    "all": "node ./index.js & node ./hlspxry.js",
+    "test": "node ./dev/test.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "chrome-launcher": "^1.2.1",
+    "express": "^5.2.1",
+    "rebrowser-puppeteer-core": "^24.8.1",
+    "undici": "^7.18.2"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "eslint": "^9.14.0"
+  }
+}
