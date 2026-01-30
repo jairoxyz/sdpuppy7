@@ -1,3 +1,4 @@
+
 import express from 'express';
 import http from 'http';
 import https from 'https';
@@ -13,11 +14,12 @@ const PORT = process.env.PROXY_PORT || 3999;
 // Environment default headers (lowest precedence)
 const ENV_DEFAULT_HEADERS = {
   // Choose a stable UA; override with ?ua=... or UPSTREAM_UA
-  'User-Agent':
-    process.env.UPSTREAM_UA ||
-    (process.platform === 'linux'
-      ? 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36'
-      : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36'),
+  'User-Agent': process.env.UPSTREAM_UA || //'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36',
+    process.env.UPSTREAM_UA || (
+        process.platform === 'linux'
+        ? 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36'
+        : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36'
+    ),
   Referer: process.env.UPSTREAM_REFERER || '',
   Origin: process.env.UPSTREAM_ORIGIN || '',
 
@@ -49,7 +51,7 @@ function toAbsolute(base, rel) {
 }
 function absolutizeKeyOrMapUri(line, baseUrl) {
   // For #EXT-X-KEY / #EXT-X-MAP lines: absolutize URI="..."
-  const m = line.match(/URI="([^"]+)"/i);
+  const m = line.match(/URI=\"([^\"]+)\"/i);
   if (m && m[1]) {
     const current = m[1];
     if (!isAbsoluteUrl(current)) {
@@ -129,7 +131,8 @@ function sanitizeH1Headers(h = {}) {
 }
 
 /**
- * Core HTTPS GET with HTTP/1.1 + TLS 1.2, following redirects.
+ * Node fetch seems to be detected and tls1.3 blocked by upstream server, so use
+ * core HTTPS GET with HTTP/1.1 + TLS 1.2, following redirects.
  * Returns { status, headers (object), body (string), finalUrl (string) }
  */
 async function getH1Tls12(url, headers = {}, maxRedirects = 5, timeoutMs = 15000) {
@@ -149,6 +152,7 @@ async function getH1Tls12(url, headers = {}, maxRedirects = 5, timeoutMs = 15000
           minVersion: 'TLSv1.2',
           maxVersion: 'TLSv1.2',
           headers: sanitizeH1Headers(headers),
+          // You can add 'ca' here if you ever need custom CA roots
         },
         (res) => {
           const { statusCode = 0, headers: resHeaders = {} } = res;
@@ -174,7 +178,7 @@ async function getH1Tls12(url, headers = {}, maxRedirects = 5, timeoutMs = 15000
             return;
           }
 
-          // Collect body as text
+          // Collect body as text (playlist is text; we keep identity encoding by default)
           res.setEncoding('utf8');
           let body = '';
           res.on('data', (c) => (body += c));
@@ -208,104 +212,13 @@ async function getH1Tls12(url, headers = {}, maxRedirects = 5, timeoutMs = 15000
   throw new Error(`Too many redirects (${maxRedirects})`);
 }
 
-/**
- * Build a proxied /playlist URL that includes the absolute upstream URL and
- * forwards header-related query params from the current request.
- */
-function buildProxyPlaylistUrl(req, absoluteTargetUrl) {
-  const params = new URLSearchParams();
-  // Always target the new URL first
-  params.set('url', absoluteTargetUrl);
-
-  // Forward header-like query params
-  const q = req.query || {};
-  const forwardList = [
-    'ua',
-    'referer',
-    'origin',
-    'cookie',
-    'accept',
-    'accept_language',
-    'accept_encoding',
-    'authorization',
-  ];
-  for (const k of forwardList) {
-    const v = q[k];
-    if (v != null && v !== '') params.set(k, String(v));
-  }
-
-  // Forward arbitrary headers (h_* -> passthrough)
-  for (const [k, v] of Object.entries(q)) {
-    if (k.toLowerCase().startsWith('h_') && v != null && v !== '') {
-      params.set(k, String(v));
-    }
-  }
-
-  return `${req.protocol}://${req.get('host')}/playlist?${params.toString()}`;
-}
-
-/**
- * Rewrite master playlist entries so that the variant/media URIs are routed
- * back through this proxy and keep header query params.
- * Handles:
- *   - #EXT-X-STREAM-INF (URI on next line)
- *   - #EXT-X-MEDIA with URI="..."
- */
-function rewriteMasterPlaylist(lines, baseUrl, req) {
-  const rewritten = [];
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-
-    // Handle #EXT-X-MEDIA with URI="..."
-    if (line.startsWith('#EXT-X-MEDIA')) {
-      const m = line.match(/URI="([^"]+)"/i);
-      if (m && m[1]) {
-        const current = m[1];
-        const abs = isAbsoluteUrl(current) ? current : toAbsolute(baseUrl, current);
-        const proxyUrl = buildProxyPlaylistUrl(req, abs);
-        rewritten.push(line.replace(m[0], `URI="${proxyUrl}"`));
-        continue;
-      }
-      rewritten.push(line);
-      continue;
-    }
-
-    // Handle #EXT-X-STREAM-INF followed by a single variant URI on the next line
-    if (line.startsWith('#EXT-X-STREAM-INF')) {
-      rewritten.push(line); // keep the tag
-
-      const nextLine = lines[i + 1] || '';
-      if (!nextLine || nextLine.startsWith('#')) {
-        // No normal URI; keep as-is
-        continue;
-      }
-
-      const absVariant = isAbsoluteUrl(nextLine) ? nextLine : toAbsolute(baseUrl, nextLine);
-      const proxied = buildProxyPlaylistUrl(req, absVariant);
-
-      // Replace the variant URI with proxied URL (headers preserved)
-      rewritten.push(proxied);
-
-      // Skip the next line since we've consumed it
-      i++;
-      continue;
-    }
-
-    // Default: leave as-is
-    rewritten.push(line);
-  }
-
-  return rewritten;
-}
-
 // ---- App ----
 const app = express();
 
 // Health check
 app.get('/health', (_req, res) => res.status(200).send('ok'));
 
-// Playlist proxy (supports master/variant; no segment proxy)
+// Playlist proxy (single-variant only; no segment proxy)
 app.get('/playlist', async (req, res) => {
   try {
     const playlistUrl = req.query.url;
@@ -323,8 +236,9 @@ app.get('/playlist', async (req, res) => {
       }
     }
 
-    // Build upstream headers
+    // Build and log upstream headers (for debugging)
     const upstreamHeaders = buildUpstreamHeaders(req);
+    //console.log(`Upstream headers: ${JSON.stringify(upstreamHeaders)}`);
 
     // Perform upstream request using core HTTPS (HTTP/1.1 + TLS 1.2)
     const r = await getH1Tls12(playlistUrl, {
@@ -360,19 +274,17 @@ app.get('/playlist', async (req, res) => {
     if (!text.trimStart().startsWith('#EXTM3U')) {
       res.set('X-Warning', 'Upstream response does not start with #EXTM3U');
     }
-
-    let processed = lines;
-
-    // If master → rewrite variant/media URIs to go back through this proxy,
-    // and include header query params in the rewritten URL
     if (isMasterPlaylist(lines)) {
-      res.set('X-Notice', 'Master playlist detected; entries rewritten to proxy.');
-      processed = rewriteMasterPlaylist(lines, baseUrl, req);
+      res.set(
+        'X-Notice',
+        'Master playlist detected; this proxy is single-variant only.'
+      );
+      // Returning it anyway; many players require proper master rewriting to work.
     }
 
-    // After master rewriting, absolutize segments + KEY/MAP URIs
+    // Absolutize segment lines + KEY/MAP URIs
     const out = [];
-    for (const line of processed) {
+    for (const line of lines) {
       if (!line || line.startsWith('#')) {
         if (line.startsWith('#EXT-X-KEY') || line.startsWith('#EXT-X-MAP')) {
           out.push(absolutizeKeyOrMapUri(line, baseUrl));
@@ -380,7 +292,6 @@ app.get('/playlist', async (req, res) => {
           out.push(line);
         }
       } else {
-        // Non-tag line (e.g., segment or variant). If already absolute (proxy URL or absolute origin), pass through.
         out.push(isAbsoluteUrl(line) ? line : toAbsolute(baseUrl, line));
       }
     }
@@ -393,10 +304,11 @@ app.get('/playlist', async (req, res) => {
 
     res.status(200);
     res.set('Content-Type', 'application/vnd.apple.mpegurl; charset=utf-8');
-    res.set('Cache-Control', 'no-store, must-revalidate');
+    res.set('Cache-Control', 'no-store, must-revalidate');    
     if (r.headers['server']) {
       res.set('Server', r.headers['server']);
     }
+    //console.log(r.headers);
     // res.set('Pragma', 'no-cache'); // optional
     res.send(out.join('\n'));
   } catch (err) {

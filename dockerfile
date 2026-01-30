@@ -13,8 +13,8 @@ RUN printf "I am running on ${BUILDPLATFORM}, building for ${TARGETPLATFORM}\n"
 RUN apt-get update && apt-get install -y \
     # dumb-init \
     bash \
-    curl \
-    ca-certificates \
+    # curl \
+    # ca-certificates \
     chromium \
     # chromium-driver \
     # xvfb \

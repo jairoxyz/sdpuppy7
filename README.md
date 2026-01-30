@@ -8,7 +8,7 @@ Extracts hls playlist urls from some sites using JW Player bundle_jw.js and prov
 
 **Extract playlist**
 
-http://localhost:4000/get?url=some_embed_url&referer=some_site
+http://localhost:4000/get?url=some_urlencoded_embed_url&referer=some_site
 
 **Proxy playlist**
 

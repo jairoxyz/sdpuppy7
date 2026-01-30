@@ -41,7 +41,7 @@ set -euo pipefail
 # Ensure we’re in the right directory (optional if WORKDIR is set)
 cd /home/node/app
 
-# Generate an in-memory ecosystem for both services
+# Generate an in-memory (heredoc) ecosystem for both services
 cat >/tmp/ecosystem.json <<'JSON'
 {
   "apps": [
