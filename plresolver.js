@@ -47,7 +47,7 @@ export async function getSrc(embedUrl, referer, timeoutMs = 10_000) {
 
     // Block only trivial asset types (keep media/xhr/script/etc.!)
     const type = req.resourceType();
-    if (type === 'image' || type === 'font') {
+    if (type === 'image' || type === 'font' || type === 'stylesheet') {
       try { req.abort(); } catch {}
     } else {
       try { req.continue(); } catch {}
