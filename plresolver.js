@@ -1,29 +1,15 @@
-
 import puppeteer from 'rebrowser-puppeteer-core';
 import { Launcher } from 'chrome-launcher';
 
 const USER_AGENT =
   process.platform === 'linux'
     ? 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36'
-    : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36';
-
-/**
- * Navigates to `embedUrl` and returns the first request URL that contains `.m3u8`.
- *
- * @param {string} embedUrl - Embed page URL.
- * @param {string} referer  - Referer header value to send.
- * @param {number} timeoutMs - Overall timeout for matching, default 30s.
- * @returns {Promise<string|null>} - The matched .m3u8 URL or null if not found.
- */
+    : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36';
 
 export async function getSrc(embedUrl, referer, timeoutMs = 10_000) {
-
   const installations = await Launcher.getInstallations();
-  if (!installations || installations.length === 0) {
-    throw new Error('No Chrome/Chromium installations found by chrome-launcher.');
-  }
+  if (!installations.length) throw new Error('No Chrome found');
   const chromePath = installations[0];
-
 
   const browser = await puppeteer.launch({
     executablePath: chromePath,
@@ -33,70 +19,79 @@ export async function getSrc(embedUrl, referer, timeoutMs = 10_000) {
       '--disable-setuid-sandbox',
       '--disable-gpu',
       '--mute-audio',
-      // Optional: minimize extra features (tune as you like)
-      '--disable-features=Translate,OptimizationHints,MediaRouter,DialMediaRouteProvider,CalculateNativeWinOcclusion,InterestFeedContentSuggestions,CertificateTransparencyComponentUpdater,AutofillServerCommunication,PrivacySandboxSettings4,AutomationControlled',
     ],
-    defaultViewport: {
-      width: 1920,
-      height: 1080,
-      deviceScaleFactor: 1,
-      isMobile: false,
-      hasTouch: false,
-      isLandscape: true,
-    },
+    defaultViewport: { width: 1920, height: 1080 },
   });
 
   const page = await browser.newPage();
-
   await page.setUserAgent(USER_AGENT);
-  await page.setExtraHTTPHeaders({ Referer: referer });
 
-  // Promise that resolves on first .m3u8 request (no interception needed)
-  const m3u8Promise = new Promise((resolve) => {
-    let settled = false;
+  // Intercept to both speed up and capture .m3u8 early
+  await page.setRequestInterception(true);
 
-    const timer = setTimeout(() => {
-      if (!settled) {
-        settled = true;
-        cleanup();
-        resolve(null);
-      }
-    }, timeoutMs);
+  let resolveFinal;
+  const finalPromise = new Promise((r) => (resolveFinal = r));
+  let settled = false;
 
-    const onRequest = (req) => {
-      const url = req.url();
-      //console.log(url); // uncomment to debug
-      if (!settled && url.includes('.m3u8')) {
-        settled = true;
-        clearTimeout(timer);
-        cleanup();
-        resolve(url);
-      }
-    };
+  // Detect .m3u8 anywhere
+  page.on('request', (req) => {
+    const url = req.url();
+    // console.log('[REQ]', req.resourceType(), url);
 
-    function cleanup() {
-      try { page.off('request', onRequest); } catch {}
+    if (!settled && url.includes('.m3u8')) {
+      settled = true;
+      try { req.continue(); } catch {}
+      resolveFinal(url);
+      return;
     }
 
-    page.on('request', onRequest);
-
-    // Navigate (avoid relying solely on networkidle for highly dynamic pages)
-    page.goto(embedUrl, {
-      waitUntil: 'domcontentloaded', // player init usually starts after DOM ready
-      timeout: timeoutMs,
-    }).catch(() => {
-      // If navigation throws (timeout, etc.), we still let the timer decide
-    });
+    // Block only trivial asset types (keep media/xhr/script/etc.!)
+    const type = req.resourceType();
+    if (type === 'image' || type === 'font') {
+      try { req.abort(); } catch {}
+    } else {
+      try { req.continue(); } catch {}
+    }
   });
 
+  const deadline = Date.now() + timeoutMs;
+  const timeLeft = () => Math.max(0, deadline - Date.now());
+
   try {
-    const m3u8Url = await m3u8Promise;
-    return {"src": m3u8Url} ?? {};
+    // 1) Go to the initial embed with the initial referer
+    await page.goto(embedUrl, {
+      waitUntil: 'domcontentloaded',
+      referer,
+      timeout: timeLeft(),
+    }).catch(() => { /* swallow; timer below governs */ });
+
+    if (settled) {
+      // Already saw the manifest via early network requests
+      const src = await Promise.race([finalPromise, new Promise(r => setTimeout(() => r(null), 1))]);
+      return { src };
+    }
+
+    //  Wait until either we see the .m3u8 or we time out
+    const winner = await Promise.race([
+      finalPromise,
+      new Promise((r) => setTimeout(() => r(null), timeLeft())),
+    ]);
+
+    return { src: winner || null };
   } finally {
-    // Ensure clean shutdown so Node exits (no Ctrl+C needed)
     try { await page.close(); } catch {}
     try { await browser.close(); } catch {}
   }
 }
 
+// async function main() {
+//   const x = await getSrc(
+//     //'https://embedsports.top/embed/admin/ppv-vf-b-stuttgart-vs-sc-freiburg/1'
+//     'https://embedsports.top/embed/echo/farmers-insurance-open-pga-tour-tgl-001/1',
+//     'https://streamed.pk/',
+//     15000
+//   );
+//   console.log(x);
+// }
 
+// main();
