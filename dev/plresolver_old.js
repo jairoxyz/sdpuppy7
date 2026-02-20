@@ -101,7 +101,7 @@ export async function getSrc(embedUrl, referer, timeoutMs = 10_000) {
 
 async function main() {
   
-  let finsrcs = await getSrc("https://embedsports.top/embed/admin/ppv-elche-vs-barcelona/1", "https://streamed.pk/")
+  let finsrcs = await getSrc("https://vidfast.pro/movie/533535", "https://vidfast.pro/")
   console.log(JSON.stringify(finsrcs));
 }
 

@@ -4,7 +4,7 @@ FROM node:lts-slim
 ARG TARGETPLATFORM
 ARG BUILDPLATFORM
 ARG TARGETARCH
-ARG PORT=4000
+# ARG PORT=4000
 ARG PROXY_PORT=3999
 
 RUN printf "I am running on ${BUILDPLATFORM}, building for ${TARGETPLATFORM}\n"
@@ -24,7 +24,7 @@ RUN apt-get update && apt-get install -y \
 
 # ENV CHROME_BIN=/usr/bin/chromium
 # ENV PUPPETEER_EXEC_PATH=/usr/bin/chromium
-ENV PORT=${PORT}
+# ENV PORT=${PORT}
 ENV PROXY_PORT=${PROXY_PORT}
 
 RUN npm i -g pm2
@@ -44,12 +44,13 @@ RUN npm install && \
     npm prune --production
 
 # Expose app port binding
-EXPOSE ${PORT} ${PROXY_PORT}
+# EXPOSE ${PORT} ${PROXY_PORT}
+EXPOSE ${PROXY_PORT}
 
 # ENTRYPOINT ["/usr/bin/dumb-init", "--"]
 # CMD [ "npm", "start" ]
-# CMD ["pm2-runtime", "./index.js"]
+CMD ["pm2-runtime", "./plres_hlsprxy.js"]
 
 # Start both apps via PM2 without an ecosystem file
-CMD ["bash", "-lc", "./start.sh"]
+#CMD ["bash", "-lc", "./start.sh"]
 

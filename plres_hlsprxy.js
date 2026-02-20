@@ -8,6 +8,17 @@ import crypto from 'node:crypto';
 import puppeteer from 'rebrowser-puppeteer-core';
 import { Launcher } from 'chrome-launcher';
 
+// --- Hardening: keep process alive on unexpected async errors ---
+process.on('unhandledRejection', (reason) => {
+  console.error('[UNHANDLED_REJECTION]', reason);
+  // Keep running
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('[UNCAUGHT_EXCEPTION]', err);
+  // Keep running (you requested not to stop)
+});
+
 // --- Networking defaults ---
 dns.setDefaultResultOrder('ipv4first');
 
@@ -31,8 +42,12 @@ const ALLOWLIST = (process.env.ALLOWLIST || '')
 const ALLOWED_HOSTS = new Set([
   'streamed.pk',
   'embedsports.top',
+  'embedsporty.top',
   'strmd.top',
   'poocloud.in',
+  'pooembed.eu',
+  'modifiles.fans',
+  'vidfast.pro',
 ]);
 
 function hostMatchesAllowed(host) {
@@ -48,6 +63,21 @@ function hostMatchesAllowed(host) {
 // ------------- Helpers -------------
 function isAbsoluteUrl(u = '') { return /^https?:\/\//i.test(u); }
 function toAbsolute(base, rel) { return new URL(rel, base).toString(); }
+
+// truthy parsing for resolve switch
+function isTruthy(v) {
+  if (v == null) return false;
+  const s = String(v).trim().toLowerCase();
+  return s === '1' || s === 'true' || s === 'yes' || s === 'y' || s === 'on';
+}
+
+// format cookies as Cookie request header
+function cookiesToHeader(cookies = []) {
+  return cookies
+    .filter(c => c?.name && c?.value)
+    .map(c => `${c.name}=${c.value}`)
+    .join('; ');
+}
 
 function absolutizeKeyOrMapUri(line, baseUrl) {
   const m = line.match(/URI="([^"]+)"/i);
@@ -74,8 +104,8 @@ function buildSidPlaylistUrl(req, absoluteTargetUrl, sid) {
   // + forward idle settings through redirect so the player keeps them
   const q = req.query || {};
   const forwardList = [
-    'ua','referer','origin','accept','accept_language','accept_encoding','authorization',
-    'idle','idle_ms', // ✅ NEW: per-session idle timeout forwarded through 302
+    'ua', 'referer', 'origin', 'accept', 'accept_language', 'accept_encoding', 'authorization',
+    'idle', 'idle_ms', // per-session idle timeout forwarded through 302
   ];
 
   for (const k of forwardList) {
@@ -131,9 +161,9 @@ function rewriteMasterPlaylist(lines, baseUrl, req, sid) {
 const SESSIONS = new Map();  // sid -> session
 
 // Session and browser cleanup
-const SESSION_TTL_MS  = 3 * 60 * 60 * 1000; // 3 hours total time to live
+const SESSION_TTL_MS = 3 * 60 * 60 * 1000; // 3 hours total time to live
 
-// ✅ Default idle timeout is 2 minutes (your requirement)
+// Default idle timeout is 2 minutes (your requirement)
 const DEFAULT_IDLE_MS = 2 * 60 * 1000;      // 2 min since last /playlist(sid=...) access
 
 // Clamp to avoid abuse / accidental extremes
@@ -223,9 +253,9 @@ async function maybeCloseBrowserIfIdle() {
 async function pruneSessions() {
   const t = nowMs();
   for (const [sid, s] of SESSIONS.entries()) {
-    const ageMs  = t - (s.createdAt || 0);
+    const ageMs = t - (s.createdAt || 0);
     const idleMs = t - (s.lastActivityAt || s.createdAt || 0);
-    const idleLimit = s.idleMs ?? DEFAULT_IDLE_MS; // ✅ per-session idle
+    const idleLimit = s.idleMs ?? DEFAULT_IDLE_MS; // per-session idle
 
     if (ageMs > SESSION_TTL_MS || idleMs > idleLimit) {
       try { await s.cleanup?.(); } catch {}
@@ -240,11 +270,21 @@ setInterval(() => {
   pruneSessions().catch(() => {});
 }, 10_000).unref(); // every 10s
 
-async function createSession({ embedUrl, referer, origin, ua, idleMs, timeoutMs = 15000 }) {
+async function createSession({ embedUrl, referer, origin, ua, idleMs, m3u8Match, timeoutMs = 15000 }) {
   const ctx = await browserMgr.newContext();
   const page = await ctx.newPage();
+
+  // --- Hardening: capture page-level errors (do not crash process) ---
+  page.on('error', (e) => console.error('[PAGE_ERROR]', e));
+  page.on('pageerror', (e) => console.error('[PAGE_PAGEERROR]', e));
+
   await page.setUserAgent(ua || DEFAULT_UA);
   await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
+
+  // optional substring that takes precedence over m3u8 detection
+  const matchSub = (m3u8Match != null && String(m3u8Match).trim() !== '')
+    ? String(m3u8Match)
+    : '';
 
   // Only block base64 images and off-domain navigations
   await page.setRequestInterception(true);
@@ -279,15 +319,17 @@ async function createSession({ embedUrl, referer, origin, ua, idleMs, timeoutMs 
   const waiters = new Map(); // url -> Set(resolveFn)
 
   page.on('response', async (res) => {
-    const url = res.url();
-    console.log('[RES]', url); // (Optional) noisy; you can remove if you want
-
-    const ct  = (res.headers()['content-type'] || '').toLowerCase();
-    const isM3U8 = url.toLowerCase().includes('.m3u8') ||
-                   ct.includes('application/vnd.apple.mpegurl') ||
-                   ct.includes('application/x-mpegurl');
-    if (!isM3U8) return;
     try {
+      const url = res.url();
+      // console.log('[RES]', url); // (Optional) noisy; you can remove if you want
+
+      const ct = (res.headers()['content-type'] || '').toLowerCase();
+      const isM3U8 = (matchSub && url.includes(matchSub)) ||
+        url.toLowerCase().includes('.m3u8') ||
+        ct.includes('application/vnd.apple.mpegurl') ||
+        ct.includes('application/x-mpegurl');
+      if (!isM3U8) return;
+
       const text = await res.text();
       const entry = { text, status: res.status(), headers: res.headers(), ts: nowMs() };
       cache.set(url, entry);
@@ -296,24 +338,30 @@ async function createSession({ embedUrl, referer, origin, ua, idleMs, timeoutMs 
         for (const resolve of set) resolve(entry);
         waiters.delete(url);
       }
-    } catch {}
+    } catch {
+      // swallow to avoid unhandled rejections from event handler
+    }
   });
 
   // Promise to get first playlist quickly
   let firstResolve;
   const firstPromise = new Promise((r) => (firstResolve = r));
   const onFirst = async (res) => {
-    const url = res.url();
-    const ct  = (res.headers()['content-type'] || '').toLowerCase();
-    const isM3U8 = url.toLowerCase().includes('.m3u8') ||
-                   ct.includes('application/vnd.apple.mpegurl') ||
-                   ct.includes('application/x-mpegurl');
-    if (!isM3U8) return;
     try {
+      const url = res.url();
+      const ct = (res.headers()['content-type'] || '').toLowerCase();
+      const isM3U8 = (matchSub && url.includes(matchSub)) ||
+        url.toLowerCase().includes('.m3u8') ||
+        ct.includes('application/vnd.apple.mpegurl') ||
+        ct.includes('application/x-mpegurl');
+      if (!isM3U8) return;
+
       const text = await res.text();
       firstResolve({ url, text, status: res.status(), headers: res.headers() });
       page.off('response', onFirst);
-    } catch {}
+    } catch {
+      // swallow
+    }
   };
   page.on('response', onFirst);
 
@@ -324,11 +372,11 @@ async function createSession({ embedUrl, referer, origin, ua, idleMs, timeoutMs 
     page,       // embed page (never navigate away)
     embedUrl,
     referer,
-    origin,
+    origin, // store origin for resolve headers output
     ua: ua || DEFAULT_UA,
     createdAt: nowMs(),
     lastActivityAt: nowMs(), // activity timestamp
-    idleMs: idleMs || DEFAULT_IDLE_MS, // ✅ NEW: per-session idle timeout
+    idleMs: idleMs || DEFAULT_IDLE_MS, // per-session idle timeout
     cache,
     waiters,
     async waitForUrl(url, timeoutMsWait = 10000) {
@@ -381,9 +429,9 @@ function getSessionOrThrow(sid) {
   if (!s) throw new Error('Invalid or expired session (sid). Start with ?embed=...');
 
   const t = nowMs();
-  const ageMs  = t - (s.createdAt || 0);
+  const ageMs = t - (s.createdAt || 0);
   const idleMs = t - (s.lastActivityAt || s.createdAt || 0);
-  const idleLimit = s.idleMs ?? DEFAULT_IDLE_MS; // ✅ per-session idle
+  const idleLimit = s.idleMs ?? DEFAULT_IDLE_MS; // per-session idle
 
   // enforce TTL + idle immediately (not only in background prune)
   if (ageMs > SESSION_TTL_MS || idleMs > idleLimit) {
@@ -408,9 +456,9 @@ app.get('/health', (_req, res) => res.status(200).send('ok'));
 
 app.get('/playlist', async (req, res) => {
   try {
-    const embedUrl    = req.query.embed?.toString();
+    const embedUrl = req.query.embed?.toString();
     const playlistUrl = req.query.url?.toString();
-    const sid         = req.query.sid?.toString();
+    const sid = req.query.sid?.toString();
 
     // allowlist
     const toCheck = embedUrl || playlistUrl;
@@ -424,23 +472,64 @@ app.get('/playlist', async (req, res) => {
       return;
     }
 
-    const ua      = req.query.ua?.toString()      || DEFAULT_UA;
+    const ua = req.query.ua?.toString() || DEFAULT_UA;
     const referer = req.query.referer?.toString() || process.env.UPSTREAM_REFERER || '';
-    const origin  = req.query.origin?.toString()  || process.env.UPSTREAM_ORIGIN  || '';
+    const origin = req.query.origin?.toString() || process.env.UPSTREAM_ORIGIN || '';
 
-    // ---- Warm-up from embed: respond with 302 to sid URL ----
+    // ---- Warm-up from embed: respond with 302 to sid URL (or resolve-only JSON) ----
     if (embedUrl && !sid) {
-      const idleMs = parseIdleMs(req); // ✅ NEW: per-session idle config
+      const resolveOnly =
+        // isTruthy(req.query.resolve) ||
+        isTruthy(req.query.resolve_only); // ||
+      // isTruthy(req.query.url_only);
 
-      const { sid: newSid, firstPlaylist } = await createSession({
+      const idleMs = parseIdleMs(req); // per-session idle config
+      const m3u8Match = req.query.m3u8_match?.toString() || '';
+
+      const { sid: newSid, session, firstPlaylist } = await createSession({
         embedUrl, referer, origin, ua,
-        idleMs, // ✅ NEW
+        idleMs,
+        m3u8Match,
         timeoutMs: 15000,
       });
 
+      // cleanup session on firstPlaylist failure to avoid leaks
       if (!firstPlaylist?.url) {
-        res.status(502).set('Content-Type', 'text/plain; charset=utf-8')
+        try { await session.cleanup?.(); } catch {}
+        try { SESSIONS.delete(newSid); } catch {}
+        await maybeCloseBrowserIfIdle();
+
+        res.status(502)
+          .set('Cache-Control', 'no-store, must-revalidate')
+          .set('Content-Type', 'text/plain; charset=utf-8')
           .send(`Failed to capture first playlist for embed.\n${firstPlaylist?.error || 'empty'}`);
+        return;
+      }
+
+      // resolve-only mode: return first playlist URL + headers (incl cookies if any), then cleanup immediately
+      if (resolveOnly) {
+        const resolvedUrl = firstPlaylist.url;
+
+        // cookies that apply to the resolved playlist URL
+        let playlistCookies = [];
+        try { playlistCookies = await session.page.cookies(resolvedUrl); } catch {}
+        const cookieHeader = cookiesToHeader(playlistCookies);
+
+        const headers = {
+          'User-Agent': session.ua,
+          ...(session.referer ? { 'Referer': session.referer } : {}),
+          ...(session.origin ? { 'Origin': session.origin } : {}),
+          ...(cookieHeader ? { 'Cookie': cookieHeader } : {}),
+        };
+
+        // close session + browser (if no sessions remain)
+        try { await session.cleanup?.(); } catch {}
+        SESSIONS.delete(newSid);
+        await maybeCloseBrowserIfIdle();
+
+        res.status(200)
+          .set('Cache-Control', 'no-store, must-revalidate')
+          .json({ ok: true, url: resolvedUrl, headers });
         return;
       }
 
@@ -539,6 +628,19 @@ app.get('/session/close', async (req, res) => {
 
 // Start server
 const server = http.createServer(app);
+
+// --- Hardening: keep server alive on low-level HTTP errors ---
+server.on('error', (err) => {
+  console.error('[SERVER_ERROR]', err);
+});
+
+server.on('clientError', (err, socket) => {
+  console.error('[CLIENT_ERROR]', err?.message || err);
+  try {
+    socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
+  } catch {}
+});
+
 server.listen(PORT, () => {
   console.log(`Headless HLS playlist resolver and proxy on ${PORT}`);
 });

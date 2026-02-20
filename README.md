@@ -8,11 +8,15 @@ Extracts hls playlist urls from some sites using JW Player bundle_jw.js and prov
 
 **Extract playlist**
 
-http://localhost:4000/get?url=some_urlencoded_embed_url&referer=some_site
+http://localhost:3999/playlist?url=some_urlencoded_embed_url&referer=some_site&resolve_only=1
 
-**Proxy playlist**
+**Extract playlist matching some url path**
 
-http://localhost:3999/playlist?url=https%3A%2F%2Fcdn.example.com%2Fpath%2Findex.m3u8
+http://localhost:3999/playlist?url=some_urlencoded_embed_url&referer=some_site&resolve_only=1&m3u8_match=some_url_path
+
+**Resolve and proxy playlist with optional session ttl in secs (default 120)**
+
+http://localhost:3999/playlist?url=some_urlencoded_embed_url&referer=some_site&idle=secs
 
 
 
@@ -29,8 +33,8 @@ To test: `npm run test`
 
 **Docker**
 
-To build: `docker build -t sdpuppy7:1.x .`
+To build: `docker build -t sdpuppy7:latest .`
 
-To run: `docker run --init --restart=always --name sdpuppy7 -d -p 4000:4000 -p 3999:3999 sdpuppy7:1.x`
+To run: `docker run --init --restart=always --name sdpuppy7 -d -p 3999:3999 sdpuppy7:latest`
 
-To change ports: `-e PORT=1235 -p 1235:1235 -e PROXY_PORT=1234 -p 1235:1234`
+To change ports: `-e PROXY_PORT=1234 -p 1235:1234`

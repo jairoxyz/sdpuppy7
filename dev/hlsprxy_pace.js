@@ -71,13 +71,8 @@ function buildSidPlaylistUrl(req, absoluteTargetUrl, sid) {
   params.set('sid', sid);
 
   // Forward useful params that influence upstream behavior (optional)
-  // + forward idle settings through redirect so the player keeps them
   const q = req.query || {};
-  const forwardList = [
-    'ua','referer','origin','accept','accept_language','accept_encoding','authorization',
-    'idle','idle_ms', // ✅ NEW: per-session idle timeout forwarded through 302
-  ];
-
+  const forwardList = ['ua','referer','origin','accept','accept_language','accept_encoding','authorization'];
   for (const k of forwardList) {
     const v = q[k];
     if (v != null && v !== '') params.set(k, String(v));
@@ -127,48 +122,6 @@ function rewriteMasterPlaylist(lines, baseUrl, req, sid) {
   return out;
 }
 
-// ------------- Session Store (single page per sid) -------------
-const SESSIONS = new Map();  // sid -> session
-
-// Session and browser cleanup
-const SESSION_TTL_MS  = 3 * 60 * 60 * 1000; // 3 hours total time to live
-
-// ✅ Default idle timeout is 2 minutes (your requirement)
-const DEFAULT_IDLE_MS = 2 * 60 * 1000;      // 2 min since last /playlist(sid=...) access
-
-// Clamp to avoid abuse / accidental extremes
-const MIN_IDLE_MS = 15 * 1000;              // 15 seconds
-const MAX_IDLE_MS = 30 * 60 * 1000;         // 30 minutes
-
-function clamp(n, min, max) {
-  return Math.max(min, Math.min(max, n));
-}
-
-/**
- * Parse per-session idle timeout from request query:
- * - idle_ms=<milliseconds> has priority
- * - idle=<seconds> is also supported
- * - returns DEFAULT_IDLE_MS if not provided or invalid
- */
-function parseIdleMs(req) {
-  const q = req.query || {};
-
-  if (q.idle_ms != null && q.idle_ms !== '') {
-    const ms = Number(q.idle_ms);
-    if (Number.isFinite(ms) && ms > 0) return clamp(ms, MIN_IDLE_MS, MAX_IDLE_MS);
-  }
-
-  if (q.idle != null && q.idle !== '') {
-    const sec = Number(q.idle);
-    if (Number.isFinite(sec) && sec > 0) return clamp(sec * 1000, MIN_IDLE_MS, MAX_IDLE_MS);
-  }
-
-  return DEFAULT_IDLE_MS;
-}
-
-function nowMs() { return Date.now(); }
-function newSid() { return crypto.randomUUID(); }
-
 // ------------- Browser Manager -------------
 class BrowserManager {
   constructor() {
@@ -209,7 +162,17 @@ class BrowserManager {
 }
 const browserMgr = new BrowserManager();
 
-// Close browser when no sessions remain (optional but recommended)
+// ------------- Session Store (single page per sid) -------------
+const SESSIONS = new Map();  // sid -> session
+
+// ✅ UPDATED: 3 hours TTL + 60 seconds idle
+const SESSION_TTL_MS  = 3 * 60 * 60 * 1000; // 3 hours
+const SESSION_IDLE_MS = 60 * 1000;          // 60 seconds since last /playlist(sid=...) access
+
+function nowMs() { return Date.now(); }
+function newSid() { return crypto.randomUUID(); }
+
+// ✅ NEW: Close browser when no sessions remain (optional but recommended)
 async function maybeCloseBrowserIfIdle() {
   if (SESSIONS.size === 0 && browserMgr.browser) {
     try { await browserMgr.browser.close(); } catch {}
@@ -219,18 +182,17 @@ async function maybeCloseBrowserIfIdle() {
   }
 }
 
-// prune by TTL OR idle; run frequently so idle is accurate
+// ✅ UPDATED: prune by TTL OR idle; run frequently so 60s idle is accurate
 async function pruneSessions() {
   const t = nowMs();
   for (const [sid, s] of SESSIONS.entries()) {
     const ageMs  = t - (s.createdAt || 0);
     const idleMs = t - (s.lastActivityAt || s.createdAt || 0);
-    const idleLimit = s.idleMs ?? DEFAULT_IDLE_MS; // ✅ per-session idle
 
-    if (ageMs > SESSION_TTL_MS || idleMs > idleLimit) {
+    if (ageMs > SESSION_TTL_MS || idleMs > SESSION_IDLE_MS) {
       try { await s.cleanup?.(); } catch {}
       SESSIONS.delete(sid);
-      console.log(`[SESSION] Closed sid=${sid} age=${ageMs}ms idle=${idleMs}ms idleLimit=${idleLimit}ms`);
+      console.log(`[SESSION] Closed sid=${sid} age=${ageMs}ms idle=${idleMs}ms`);
     }
   }
   await maybeCloseBrowserIfIdle();
@@ -240,7 +202,7 @@ setInterval(() => {
   pruneSessions().catch(() => {});
 }, 10_000).unref(); // every 10s
 
-async function createSession({ embedUrl, referer, origin, ua, idleMs, timeoutMs = 15000 }) {
+async function createSession({ embedUrl, referer, origin, ua, timeoutMs = 15000 }) {
   const ctx = await browserMgr.newContext();
   const page = await ctx.newPage();
   await page.setUserAgent(ua || DEFAULT_UA);
@@ -327,8 +289,7 @@ async function createSession({ embedUrl, referer, origin, ua, idleMs, timeoutMs 
     origin,
     ua: ua || DEFAULT_UA,
     createdAt: nowMs(),
-    lastActivityAt: nowMs(), // activity timestamp
-    idleMs: idleMs || DEFAULT_IDLE_MS, // ✅ NEW: per-session idle timeout
+    lastActivityAt: nowMs(), // ✅ NEW: activity timestamp
     cache,
     waiters,
     async waitForUrl(url, timeoutMsWait = 10000) {
@@ -383,10 +344,9 @@ function getSessionOrThrow(sid) {
   const t = nowMs();
   const ageMs  = t - (s.createdAt || 0);
   const idleMs = t - (s.lastActivityAt || s.createdAt || 0);
-  const idleLimit = s.idleMs ?? DEFAULT_IDLE_MS; // ✅ per-session idle
 
-  // enforce TTL + idle immediately (not only in background prune)
-  if (ageMs > SESSION_TTL_MS || idleMs > idleLimit) {
+  // ✅ NEW: enforce TTL + idle immediately (not only in background prune)
+  if (ageMs > SESSION_TTL_MS || idleMs > SESSION_IDLE_MS) {
     try { s.cleanup?.(); } catch {}
     SESSIONS.delete(sid);
     throw new Error('Session expired (ttl/idle). Start again with ?embed=...');
@@ -397,12 +357,6 @@ function getSessionOrThrow(sid) {
 
 // ------------- Express App -------------
 const app = express();
-app.disable('x-powered-by');
-
-app.use((req, res, next) => {
-  res.setHeader('Server', 'nginx/1.18.0');
-  next();
-});
 
 app.get('/health', (_req, res) => res.status(200).send('ok'));
 
@@ -430,12 +384,8 @@ app.get('/playlist', async (req, res) => {
 
     // ---- Warm-up from embed: respond with 302 to sid URL ----
     if (embedUrl && !sid) {
-      const idleMs = parseIdleMs(req); // ✅ NEW: per-session idle config
-
       const { sid: newSid, firstPlaylist } = await createSession({
-        embedUrl, referer, origin, ua,
-        idleMs, // ✅ NEW
-        timeoutMs: 15000,
+        embedUrl, referer, origin, ua, timeoutMs: 15000,
       });
 
       if (!firstPlaylist?.url) {
@@ -461,7 +411,7 @@ app.get('/playlist', async (req, res) => {
 
     const session = getSessionOrThrow(sid);
 
-    // activity mark (this is what the idle timeout is based on)
+    // ✅ NEW: activity mark (this is what the idle timeout is based on)
     session.lastActivityAt = nowMs();
 
     // Make the headless browser fetch the playlist directly
@@ -494,7 +444,7 @@ app.get('/playlist', async (req, res) => {
     let processed = lines;
     if (isMasterPlaylist(lines)) {
       processed = rewriteMasterPlaylist(lines, baseUrl, req, sid);
-      // res.set('X-Notice', 'Master playlist rewritten');
+      res.set('X-Notice', 'Master playlist rewritten');
     }
 
     const out = processed.map((line) => {
@@ -540,5 +490,5 @@ app.get('/session/close', async (req, res) => {
 // Start server
 const server = http.createServer(app);
 server.listen(PORT, () => {
-  console.log(`Headless HLS playlist resolver and proxy on ${PORT}`);
+  console.log(`Headless HLS single-page session proxy on ${PORT}`);
 });
