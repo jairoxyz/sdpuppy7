@@ -79,6 +79,15 @@ function cookiesToHeader(cookies = []) {
     .join('; ');
 }
 
+// records count for resolve_only mode (clamped 1..20)
+function parseRecordsCount(req, def = 1) {
+  const raw = req.query.records;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return def;
+  const i = Math.trunc(n);
+  return Math.max(1, Math.min(20, i));
+}
+
 function absolutizeKeyOrMapUri(line, baseUrl) {
   const m = line.match(/URI="([^"]+)"/i);
   if (m && m[1]) {
@@ -270,7 +279,11 @@ setInterval(() => {
   pruneSessions().catch(() => {});
 }, 10_000).unref(); // every 10s
 
-async function createSession({ embedUrl, referer, origin, ua, idleMs, m3u8Match, timeoutMs = 15000 }) {
+async function createSession({
+  embedUrl, referer, origin, ua, idleMs, m3u8Match,
+  collectCount = 1, // number of matching URLs to collect for resolve_only
+  timeoutMs = 15000
+}) {
   const ctx = await browserMgr.newContext();
   const page = await ctx.newPage();
 
@@ -281,7 +294,7 @@ async function createSession({ embedUrl, referer, origin, ua, idleMs, m3u8Match,
   await page.setUserAgent(ua || DEFAULT_UA);
   await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
 
-  // optional substring that takes precedence over m3u8 detection
+  // optional substring; when present it becomes the ONLY match condition
   const matchSub = (m3u8Match != null && String(m3u8Match).trim() !== '')
     ? String(m3u8Match)
     : '';
@@ -318,21 +331,49 @@ async function createSession({ embedUrl, referer, origin, ua, idleMs, m3u8Match,
   const cache = new Map();   // url -> { text, status, headers, ts }
   const waiters = new Map(); // url -> Set(resolveFn)
 
+  // Collect up to collectCount matching URLs (deduped), in the order seen
+  const collectedUrls = [];
+  const seenUrls = new Set();
+  let collectedResolve;
+  const collectedPromise = new Promise((r) => (collectedResolve = r));
+
+  function collectUrl(url) {
+    if (!url) return;
+    if (seenUrls.has(url)) return;
+    seenUrls.add(url);
+    collectedUrls.push(url);
+    if (collectedResolve && collectedUrls.length >= collectCount) {
+      collectedResolve(collectedUrls.slice(0, collectCount));
+      collectedResolve = null;
+    }
+  }
+
   page.on('response', async (res) => {
     try {
       const url = res.url();
-      // console.log('[RES]', url); // (Optional) noisy; you can remove if you want
+      console.log('[RES]', url);
 
       const ct = (res.headers()['content-type'] || '').toLowerCase();
-      const isM3U8 = (matchSub && url.includes(matchSub)) ||
-        url.toLowerCase().includes('.m3u8') ||
-        ct.includes('application/vnd.apple.mpegurl') ||
-        ct.includes('application/x-mpegurl');
+
+      // If matchSub is present => ONLY accept URLs that include it.
+      // Else => fallback to standard m3u8 detection.
+      const isM3U8 = matchSub
+        ? url.includes(matchSub)
+        : (
+          url.toLowerCase().includes('.m3u8') ||
+          ct.includes('application/vnd.apple.mpegurl') ||
+          ct.includes('application/x-mpegurl')
+        );
+
       if (!isM3U8) return;
+
+      // collect candidate URL(s) for resolve_only records mode
+      collectUrl(url);
 
       const text = await res.text();
       const entry = { text, status: res.status(), headers: res.headers(), ts: nowMs() };
       cache.set(url, entry);
+
       const set = waiters.get(url);
       if (set && set.size) {
         for (const resolve of set) resolve(entry);
@@ -346,15 +387,25 @@ async function createSession({ embedUrl, referer, origin, ua, idleMs, m3u8Match,
   // Promise to get first playlist quickly
   let firstResolve;
   const firstPromise = new Promise((r) => (firstResolve = r));
+
   const onFirst = async (res) => {
     try {
       const url = res.url();
       const ct = (res.headers()['content-type'] || '').toLowerCase();
-      const isM3U8 = (matchSub && url.includes(matchSub)) ||
-        url.toLowerCase().includes('.m3u8') ||
-        ct.includes('application/vnd.apple.mpegurl') ||
-        ct.includes('application/x-mpegurl');
+
+      // (same logic here)
+      const isM3U8 = matchSub
+        ? url.includes(matchSub)
+        : (
+          url.toLowerCase().includes('.m3u8') ||
+          ct.includes('application/vnd.apple.mpegurl') ||
+          ct.includes('application/x-mpegurl')
+        );
+
       if (!isM3U8) return;
+
+      // also collect here (in case this fires before the other handler completes)
+      collectUrl(url);
 
       const text = await res.text();
       firstResolve({ url, text, status: res.status(), headers: res.headers() });
@@ -421,7 +472,15 @@ async function createSession({ embedUrl, referer, origin, ua, idleMs, m3u8Match,
     new Promise((r) => setTimeout(() => r(null), timeLeft())),
   ]);
 
-  return { sid, session, firstPlaylist };
+  // If collectCount > 1, wait (within the same deadline) for enough URLs or timeout
+  if (collectCount > 1) {
+    await Promise.race([
+      collectedPromise,
+      new Promise((r) => setTimeout(() => r(null), timeLeft())),
+    ]);
+  }
+
+  return { sid, session, firstPlaylist, collectedUrls: collectedUrls.slice(0, collectCount) };
 }
 
 function getSessionOrThrow(sid) {
@@ -480,47 +539,58 @@ app.get('/playlist', async (req, res) => {
     if (embedUrl && !sid) {
       const resolveOnly =
         // isTruthy(req.query.resolve) ||
-        isTruthy(req.query.resolve_only); // ||
-      // isTruthy(req.query.url_only);
+        isTruthy(req.query.resolve_only);
+      // || isTruthy(req.query.url_only);
 
       const idleMs = parseIdleMs(req); // per-session idle config
       const m3u8Match = req.query.m3u8_match?.toString() || '';
 
-      const { sid: newSid, session, firstPlaylist } = await createSession({
+      // how many records to return in resolve_only mode (clamped 1..20)
+      const recordsCount = resolveOnly ? parseRecordsCount(req, 1) : 1;
+
+      const { sid: newSid, session, firstPlaylist, collectedUrls } = await createSession({
         embedUrl, referer, origin, ua,
         idleMs,
         m3u8Match,
+        collectCount: recordsCount,
         timeoutMs: 15000,
       });
 
-      // cleanup session on firstPlaylist failure to avoid leaks
-      if (!firstPlaylist?.url) {
-        try { await session.cleanup?.(); } catch {}
-        try { SESSIONS.delete(newSid); } catch {}
-        await maybeCloseBrowserIfIdle();
-
-        res.status(502)
-          .set('Cache-Control', 'no-store, must-revalidate')
-          .set('Content-Type', 'text/plain; charset=utf-8')
-          .send(`Failed to capture first playlist for embed.\n${firstPlaylist?.error || 'empty'}`);
-        return;
-      }
-
-      // resolve-only mode: return first playlist URL + headers (incl cookies if any), then cleanup immediately
+      // resolve-only mode: ALWAYS return records array
       if (resolveOnly) {
-        const resolvedUrl = firstPlaylist.url;
+        // Prefer collected URLs; if none, fall back to firstPlaylist if available
+        const urls = (collectedUrls && collectedUrls.length)
+          ? collectedUrls
+          : (firstPlaylist?.url ? [firstPlaylist.url] : []);
 
-        // cookies that apply to the resolved playlist URL
-        let playlistCookies = [];
-        try { playlistCookies = await session.page.cookies(resolvedUrl); } catch {}
-        const cookieHeader = cookiesToHeader(playlistCookies);
+        if (!urls.length) {
+          // cleanup on failure
+          try { await session.cleanup?.(); } catch {}
+          try { SESSIONS.delete(newSid); } catch {}
+          await maybeCloseBrowserIfIdle();
 
-        const headers = {
-          'User-Agent': session.ua,
-          ...(session.referer ? { 'Referer': session.referer } : {}),
-          ...(session.origin ? { 'Origin': session.origin } : {}),
-          ...(cookieHeader ? { 'Cookie': cookieHeader } : {}),
-        };
+          res.status(502)
+            .set('Cache-Control', 'no-store, must-revalidate')
+            .set('Content-Type', 'text/plain; charset=utf-8')
+            .send('Failed to capture any matching playlist');
+          return;
+        }
+
+        // Build records with per-URL cookie headers
+        const records = await Promise.all(urls.slice(0, recordsCount).map(async (u) => {
+          let playlistCookies = [];
+          try { playlistCookies = await session.page.cookies(u); } catch {}
+          const cookieHeader = cookiesToHeader(playlistCookies);
+
+          const headers = {
+            'User-Agent': session.ua,
+            ...(session.referer ? { 'Referer': session.referer } : {}),
+            ...(session.origin ? { 'Origin': session.origin } : {}),
+            ...(cookieHeader ? { 'Cookie': cookieHeader } : {}),
+          };
+
+          return { url: u, headers };
+        }));
 
         // close session + browser (if no sessions remain)
         try { await session.cleanup?.(); } catch {}
@@ -529,7 +599,21 @@ app.get('/playlist', async (req, res) => {
 
         res.status(200)
           .set('Cache-Control', 'no-store, must-revalidate')
-          .json({ ok: true, url: resolvedUrl, headers });
+          .json({ ok: true, records });
+        return;
+      }
+
+      // Redirect mode requires a first playlist URL
+      if (!firstPlaylist?.url) {
+        // cleanup session on firstPlaylist failure to avoid leaks
+        try { await session.cleanup?.(); } catch {}
+        try { SESSIONS.delete(newSid); } catch {}
+        await maybeCloseBrowserIfIdle();
+
+        res.status(502)
+          .set('Cache-Control', 'no-store, must-revalidate')
+          .set('Content-Type', 'text/plain; charset=utf-8')
+          .send(`Failed to capture first playlist for embed.\n${firstPlaylist?.error || 'empty'}`);
         return;
       }
 

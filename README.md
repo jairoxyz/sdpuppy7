@@ -8,15 +8,15 @@ Extracts hls playlist urls from some sites using JW Player bundle_jw.js and prov
 
 **Extract playlist**
 
-http://localhost:3999/playlist?url=some_urlencoded_embed_url&referer=some_site&resolve_only=1
+http://localhost:3999/playlist?embed=some_embed_url&referer=some_site&resolve_only=1
 
-**Extract playlist matching some url path**
+**Extract playlist records matching some url path**
 
-http://localhost:3999/playlist?url=some_urlencoded_embed_url&referer=some_site&resolve_only=1&m3u8_match=some_url_path
+http://localhost:3999/playlist?embed=some_embed_url&referer=some_site&resolve_only=1&m3u8_match=some_url_path&records=2
 
 **Resolve and proxy playlist with optional session ttl in secs (default 120)**
 
-http://localhost:3999/playlist?url=some_urlencoded_embed_url&referer=some_site&idle=secs
+http://localhost:3999/playlist?embed=some_embed_url&referer=some_site&idle=secs
 
 
 

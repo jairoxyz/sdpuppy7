@@ -1,6 +1,13 @@
 # Use a slim debian image as the base image
 FROM node:lts-slim
 
+ARG APP_VERSION="unspecified"
+ARG VCS_REF="unspecified"
+ARG BUILD_DATE="unspecified"
+LABEL org.opencontainers.image.version="${APP_VERSION}" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.created="${BUILD_DATE}"
+
 ARG TARGETPLATFORM
 ARG BUILDPLATFORM
 ARG TARGETARCH
