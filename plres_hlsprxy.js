@@ -48,6 +48,8 @@ const ALLOWED_HOSTS = new Set([
   'pooembed.eu',
   'modifiles.fans',
   'vidfast.pro',
+  'ppv.to',
+  'embed.ppv.to',
 ]);
 
 function hostMatchesAllowed(host) {
@@ -351,7 +353,7 @@ async function createSession({
   page.on('response', async (res) => {
     try {
       const url = res.url();
-      console.log('[RES]', url);
+      // console.log('[RES]', url);
 
       const ct = (res.headers()['content-type'] || '').toLowerCase();
 
