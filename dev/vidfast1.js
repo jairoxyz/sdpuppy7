@@ -6,22 +6,7 @@ const USER_AGENT =
     ? 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36'
     : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36';
 
-/**
- * Collect exactly two requests whose URL contains `matchSubstring` and return
- * their URL + request headers, in the order they were made.
- *
- * @param {string} embedUrl
- * @param {string} referer
- * @param {string} matchSubstring e.g., "/hezushon/"
- * @param {number} timeoutMs overall timeout
- * @returns {Promise<{ records: Array<{ url: string, requestHeaders: Record<string,string> }>, timedOut: boolean }>}
- */
-export async function getUris(
-  embedUrl,
-  referer,
-  matchSubstring = '/hezushon/',
-  timeoutMs = 10_000
-) {
+export async function getUri(embedUrl, referer, timeoutMs = 10_000) {
   const installations = await Launcher.getInstallations();
   if (!installations.length) throw new Error('No Chrome found');
   const chromePath = installations[0];
@@ -41,38 +26,26 @@ export async function getUris(
   const page = await browser.newPage();
   await page.setUserAgent(USER_AGENT);
 
-  // Ensure sub-requests also carry the referer when possible
-  if (referer) {
-    await page.setExtraHTTPHeaders({ referer });
-  }
-
-  // Intercept to access request headers and to prune trivial assets
+  // Intercept to both speed up and capture .m3u8 early
   await page.setRequestInterception(true);
 
-  const records = [];
-  let resolved = false;
-  let resolveDone;
-  const done = new Promise((r) => (resolveDone = r));
+  let resolveFinal;
+  const finalPromise = new Promise((r) => (resolveFinal = r));
+  let settled = false;
 
-  const finishIfReady = () => {
-    if (!resolved && records.length >= 2) {
-      resolved = true;
-      resolveDone();
-    }
-  };
-
+  // Detect .m3u8 anywhere
   page.on('request', (req) => {
     const url = req.url();
     console.log('[REQ]', req.resourceType(), url);
-    if (url.includes(matchSubstring)) {
-      records.push({
-        url,
-        requestHeaders: req.headers(), // header names are lowercased by Puppeteer
-      });
-      finishIfReady();
+
+    if (!settled && url.includes('/hezushon/')) {
+      settled = true;
+      try { req.continue(); } catch {}
+      resolveFinal(url);
+      return;
     }
 
-    // Abort trivial assets to speed up discovery
+    // Block only trivial asset types (keep media/xhr/script/etc.!)
     const type = req.resourceType();
     if (type === 'image' || type === 'font' || type === 'stylesheet') {
       try { req.abort(); } catch {}
@@ -85,37 +58,39 @@ export async function getUris(
   const timeLeft = () => Math.max(0, deadline - Date.now());
 
   try {
+    // 1) Go to the initial embed with the initial referer
     await page.goto(embedUrl, {
       waitUntil: 'domcontentloaded',
       referer,
       timeout: timeLeft(),
-    }).catch(() => { /* ignore; timer below governs */ });
+    }).catch(() => { /* swallow; timer below governs */ });
 
-    // Wait either until we have 2 matches or we time out
-    await Promise.race([
-      done,
-      new Promise((r) => setTimeout(r, timeLeft())),
+    if (settled) {
+      // Already saw the manifest via early network requests
+      const src = await Promise.race([finalPromise, new Promise(r => setTimeout(() => r(null), 1))]);
+      return { src };
+    }
+
+    //  Wait until either we see the .m3u8 or we time out
+    const winner = await Promise.race([
+      finalPromise,
+      new Promise((r) => setTimeout(() => r(null), timeLeft())),
     ]);
 
-    return {
-      records,                // up to 2 items, in call order
-      timedOut: !resolved,    // true if we didn't reach 2 before timeout
-    };
+    return { svruri: winner || null };
   } finally {
     try { await page.close(); } catch {}
     try { await browser.close(); } catch {}
   }
 }
 
-// Example usage
 async function main() {
-  const result = await getUris(
+  const x = await getUri(
     'https://vidfast.pro/movie/533535',
     'https://vidfast.pro/',
-    '/hezushon/',
     15000
   );
-  console.log(JSON.stringify(result, null, 2));
+  console.log(x);
 }
 
 main();

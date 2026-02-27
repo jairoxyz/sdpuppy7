@@ -38,3 +38,5 @@ To build: `docker build -t sdpuppy7:latest .`
 To run: `docker run --init --restart=always --name sdpuppy7 -d -p 3999:3999 sdpuppy7:latest`
 
 To change ports: `-e PROXY_PORT=1234 -p 1235:1234`
+
+To enable logging: `-e LOG=1`

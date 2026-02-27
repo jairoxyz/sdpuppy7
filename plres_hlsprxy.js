@@ -22,6 +22,24 @@ process.on('uncaughtException', (err) => {
 // --- Networking defaults ---
 dns.setDefaultResultOrder('ipv4first');
 
+// --- Logging ---
+const LOG_ENABLED =
+  (process.env.LOG ?? process.env.DEBUG ?? '').toString().trim().toLowerCase();
+
+const DEFAULT_LOG_ON =
+  LOG_ENABLED === '1' || LOG_ENABLED === 'true' || LOG_ENABLED === 'yes' || LOG_ENABLED === 'on';
+
+function log(...args) {
+  if (DEFAULT_LOG_ON) console.log(...args);
+}
+function warn(...args) {
+  if (DEFAULT_LOG_ON) console.warn(...args);
+}
+function errorLog(...args) {
+  // usually keep errors always on; but you can also gate this if you want
+  console.error(...args);
+}
+
 // --- Config ---
 const PORT = process.env.PROXY_PORT || 3999;
 
@@ -256,7 +274,7 @@ async function maybeCloseBrowserIfIdle() {
     try { await browserMgr.browser.close(); } catch {}
     browserMgr.browser = null;
     browserMgr.chromePath = null;
-    console.log('[BROWSER] Closed (no active sessions)');
+    log('[BROWSER] Closed (no active sessions)');
   }
 }
 
@@ -271,7 +289,7 @@ async function pruneSessions() {
     if (ageMs > SESSION_TTL_MS || idleMs > idleLimit) {
       try { await s.cleanup?.(); } catch {}
       SESSIONS.delete(sid);
-      console.log(`[SESSION] Closed sid=${sid} age=${ageMs}ms idle=${idleMs}ms idleLimit=${idleLimit}ms`);
+      log(`[SESSION] Closed sid=${sid} age=${ageMs}ms idle=${idleMs}ms idleLimit=${idleLimit}ms`);
     }
   }
   await maybeCloseBrowserIfIdle();
@@ -333,6 +351,9 @@ async function createSession({
   const cache = new Map();   // url -> { text, status, headers, ts }
   const waiters = new Map(); // url -> Set(resolveFn)
 
+  // store actual request headers for each playlist URL (referer/origin etc.)
+  const requestMeta = new Map(); // url -> { reqHeaders, referer, origin, frameUrl, ts }
+
   // Collect up to collectCount matching URLs (deduped), in the order seen
   const collectedUrls = [];
   const seenUrls = new Set();
@@ -350,10 +371,21 @@ async function createSession({
     }
   }
 
+  // Promise to get first playlist quickly
+  let firstResolve;
+  const firstPromise = new Promise((r) => (firstResolve = r));
+
+  // Single response handler: detect m3u8, capture body once, capture real request headers
   page.on('response', async (res) => {
     try {
       const url = res.url();
-      // console.log('[RES]', url);
+
+      // ignore data:* and chrome*
+      if (url.startsWith('data:') ||
+          url.startsWith('chrome:') ||
+          url.startsWith('chrome-extension:')) return;
+
+      log('[RESP]', url);
 
       const ct = (res.headers()['content-type'] || '').toLowerCase();
 
@@ -372,10 +404,33 @@ async function createSession({
       // collect candidate URL(s) for resolve_only records mode
       collectUrl(url);
 
+      // Capture *actual request headers* Chromium used for this playlist request
+      const req = res.request?.();
+      const reqHeaders = req?.headers?.() || {};
+      const frameUrl = req?.frame?.()?.url?.() || '';
+      const refererHdr = reqHeaders['referer'] || '';
+      const originHdr  = reqHeaders['origin']  || '';
+
+      requestMeta.set(url, {
+        reqHeaders,
+        referer: refererHdr,
+        origin: originHdr,
+        frameUrl,
+        ts: nowMs(),
+      });
+
+      // Read body once
       const text = await res.text();
       const entry = { text, status: res.status(), headers: res.headers(), ts: nowMs() };
       cache.set(url, entry);
 
+      // Resolve first playlist once
+      if (firstResolve) {
+        firstResolve({ url, ...entry });
+        firstResolve = null;
+      }
+
+      // Wake waiters
       const set = waiters.get(url);
       if (set && set.size) {
         for (const resolve of set) resolve(entry);
@@ -385,38 +440,6 @@ async function createSession({
       // swallow to avoid unhandled rejections from event handler
     }
   });
-
-  // Promise to get first playlist quickly
-  let firstResolve;
-  const firstPromise = new Promise((r) => (firstResolve = r));
-
-  const onFirst = async (res) => {
-    try {
-      const url = res.url();
-      const ct = (res.headers()['content-type'] || '').toLowerCase();
-
-      // (same logic here)
-      const isM3U8 = matchSub
-        ? url.includes(matchSub)
-        : (
-          url.toLowerCase().includes('.m3u8') ||
-          ct.includes('application/vnd.apple.mpegurl') ||
-          ct.includes('application/x-mpegurl')
-        );
-
-      if (!isM3U8) return;
-
-      // also collect here (in case this fires before the other handler completes)
-      collectUrl(url);
-
-      const text = await res.text();
-      firstResolve({ url, text, status: res.status(), headers: res.headers() });
-      page.off('response', onFirst);
-    } catch {
-      // swallow
-    }
-  };
-  page.on('response', onFirst);
 
   const sid = newSid();
   const session = {
@@ -432,6 +455,8 @@ async function createSession({
     idleMs: idleMs || DEFAULT_IDLE_MS, // per-session idle timeout
     cache,
     waiters,
+    requestMeta, //request headers etc.
+
     async waitForUrl(url, timeoutMsWait = 10000) {
       const existing = cache.get(url);
       if (existing) return existing;
@@ -578,20 +603,39 @@ app.get('/playlist', async (req, res) => {
           return;
         }
 
-        // Build records with per-URL cookie headers
+        // Build records with per-URL cookie headers + actual referer/origin from Chromium request
         const records = await Promise.all(urls.slice(0, recordsCount).map(async (u) => {
           let playlistCookies = [];
           try { playlistCookies = await session.page.cookies(u); } catch {}
           const cookieHeader = cookiesToHeader(playlistCookies);
 
+          const meta = session.requestMeta?.get(u);
+          const realReferer = meta?.referer || session.referer || '';
+          const realOrigin  = meta?.origin  || session.origin  || '';
+
+          // Start from Chromium's actual request header set,
+          const base = meta?.reqHeaders ? { ...meta.reqHeaders } : {};
+
           const headers = {
-            'User-Agent': session.ua,
-            ...(session.referer ? { 'Referer': session.referer } : {}),
-            ...(session.origin ? { 'Origin': session.origin } : {}),
-            ...(cookieHeader ? { 'Cookie': cookieHeader } : {}),
+            ...base,
+            // normalize/override if needed
+            // 'User-Agent': session.ua,
+            // ...(realReferer ? { 'Referer': realReferer } : {}),
+            // ...(realOrigin  ? { 'Origin':  realOrigin  } : {}),
+            // ...(cookieHeader ? { 'Cookie': cookieHeader } : {}),
           };
 
-          return { url: u, headers };
+          // Avoid forwarding problematic hop-by-hop/derived headers
+          delete headers['host'];
+          delete headers['Host'];
+          delete headers['content-length'];
+          delete headers['Content-Length'];
+
+          return {
+            url: u,
+            headers,
+            initiator: meta?.frameUrl || null,
+          };
         }));
 
         // close session + browser (if no sessions remain)
