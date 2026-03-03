@@ -68,6 +68,7 @@ const ALLOWED_HOSTS = new Set([
   'vidfast.pro',
   'ppv.to',
   'embed.ppv.to',
+  '111movies.net',
 ]);
 
 function hostMatchesAllowed(host) {
@@ -248,6 +249,12 @@ class BrowserManager {
         '--disable-setuid-sandbox',
         '--disable-gpu',
         '--mute-audio',
+        '--disable-web-security',
+        //'--disable-features=Translate,OptimizationHints,MediaRouter,DialMediaRouteProvider,CalculateNativeWinOcclusion,InterestFeedContentSuggestions,CertificateTransparencyComponentUpdater,AutofillServerCommunication,PrivacySandboxSettings4,AutomationControlled',
+        // WebRTC hard-disable
+        '--disable-webrtc',
+        //'--disable-features=WebRtcHideLocalIpsWithMdns', /* disabled with above */
+        '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
       ],
       defaultViewport: { width: 1280, height: 720 },
     });
@@ -326,7 +333,9 @@ async function createSession({
       const urlStr = req.url();
 
       // Block inline base64 images (safe for HLS)
-      if (urlStr.startsWith('data:image/')) {
+      if (url.startsWith('data:') ||
+          url.startsWith('chrome:') ||
+          url.startsWith('chrome-extension:')) {
         return req.abort();
       }
 

@@ -44,7 +44,7 @@ RUN chown -R node:node /home/node/app
 
 # Bundle app source and chown to non root
 COPY --chown=node:node . .
-RUN chmod +x /home/node/app/start.sh
+# RUN chmod +x /home/node/app/start.sh
 
 # Install, build, and remove source code & dev packages
 RUN npm install && \
