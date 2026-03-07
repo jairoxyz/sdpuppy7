@@ -15,7 +15,8 @@
     "chrome-launcher": "^1.2.1",
     "express": "^5.2.1",
     "rebrowser-puppeteer-core": "^24.8.1",
-    "undici": "^7.18.2"
+    "undici": "^7.18.2",
+    "xvfb": "^0.4.0"
   },
   "devDependencies": {
     "concurrently": "^9.2.1",

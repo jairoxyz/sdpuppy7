@@ -8,6 +8,8 @@ import crypto from 'node:crypto';
 import puppeteer from 'rebrowser-puppeteer-core';
 import { Launcher } from 'chrome-launcher';
 
+import Xvfb from 'xvfb';
+
 // --- Hardening: keep process alive on unexpected async errors ---
 process.on('unhandledRejection', (reason) => {
   console.error('[UNHANDLED_REJECTION]', reason);
@@ -47,8 +49,8 @@ const PORT = process.env.PROXY_PORT || 3999;
 const DEFAULT_UA =
   process.env.UPSTREAM_UA ||
   (process.platform === 'linux'
-    ? 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36'
-    : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36');
+    ? 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.7632.159 Safari/537.36'
+    : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36');
 
 // Optional allowlist (safety)
 const ALLOWLIST = (process.env.ALLOWLIST || '')
@@ -57,7 +59,7 @@ const ALLOWLIST = (process.env.ALLOWLIST || '')
   .filter(Boolean);
 
 // --- Allowed embed + network hosts (match subdomains too) ---
-const ALLOWED_HOSTS = new Set([
+let ALLOWED_HOSTS = new Set([
   'streamed.pk',
   'embedsports.top',
   'embedsporty.top',
@@ -69,9 +71,19 @@ const ALLOWED_HOSTS = new Set([
   'ppv.to',
   'embed.ppv.to',
   '111movies.net',
+  'hexa.su',
+  'flixer.su',
+  'dlstreams.top',
+  // 'adffdafdsafds.sbs',
+  // 'www.google.com',
+  // 'www.gstatic.com',
 ]);
 
+// --- allow all hosts for now
+//ALLOWED_HOSTS = new Set([]);
+
 function hostMatchesAllowed(host) {
+  if (!ALLOWED_HOSTS || ALLOWED_HOSTS.size === 0) return true;
   if (!host) return false;
   const h = host.toLowerCase();
   for (const base of ALLOWED_HOSTS) {
@@ -124,7 +136,7 @@ function isMasterPlaylist(lines) {
   return lines.some(ln => ln.startsWith('#EXT-X-STREAM-INF') || ln.startsWith('#EXT-X-MEDIA'));
 }
 
-/** Build the canonical sid URL for a playlist we want the player to use */
+/** Build the canonical sid URLs for a playlist and key uri we want the player to use */
 function buildSidPlaylistUrl(req, absoluteTargetUrl, sid) {
   const params = new URLSearchParams();
   params.set('url', absoluteTargetUrl);
@@ -148,6 +160,19 @@ function buildSidPlaylistUrl(req, absoluteTargetUrl, sid) {
     }
   }
   return `${req.protocol}://${req.get('host')}/playlist?${params.toString()}`;
+}
+
+function buildSidKeyUrl(req, absoluteKeyUrl, sid) {
+  const params = new URLSearchParams();
+  params.set('url', absoluteKeyUrl);
+  params.set('sid', sid);
+
+  // Only forward idle controls (optional)
+  const q = req.query || {};
+  if (q.idle_ms != null && q.idle_ms !== '') params.set('idle_ms', String(q.idle_ms));
+  else if (q.idle != null && q.idle !== '') params.set('idle', String(q.idle));
+
+  return `${req.protocol}://${req.get('host')}/key?${params.toString()}`;
 }
 
 /** Rewrite MASTER playlists to point variant/media playlists back to this proxy with the same sid.
@@ -185,6 +210,23 @@ function rewriteMasterPlaylist(lines, baseUrl, req, sid) {
     out.push(line);
   }
   return out;
+}
+
+/* Rewrite #EXT-X-KEY to proxy */
+function rewriteExtXKeyUriToProxy(line, baseUrl, req, sid) {
+  if (!line.startsWith('#EXT-X-KEY')) return line;
+
+  const m = line.match(/URI=("([^"]+)"|([^,]+))/i);
+  if (!m) return line;
+  const raw = (m[2] || m[3] || '').trim();
+  if (!raw) return line;
+
+  // Make absolute against playlist base URL
+  const abs = isAbsoluteUrl(raw) ? raw : toAbsolute(baseUrl, raw);
+  if (!/^https?:\/\//i.test(abs)) return line;
+
+  const proxied = buildSidKeyUrl(req, abs, sid);
+  return line.replace(/URI=("([^"]+)"|([^,]+))/i, `URI="${proxied}"`);
 }
 
 // ------------- Session Store (single page per sid) -------------
@@ -234,32 +276,77 @@ class BrowserManager {
   constructor() {
     this.browser = null;
     this.chromePath = null;
+    this.xvfbsession = null;
   }
+
+  startXvfbIfNeeded() {
+    // You want non-headless on Linux, so Xvfb should start on Linux.
+    if (process.platform !== 'linux') return;
+    if (this.xvfbsession) return;
+
+    try {
+      this.xvfbsession = new Xvfb({
+        silent: true,
+        xvfb_args: ['-screen', '0', '1920x1080x24', '-ac'],
+      });
+      this.xvfbsession.startSync();
+      log('[XVFB] Started');
+    } catch (err) {
+      console.error('Xvfb start error:', err?.message || err);
+      this.xvfbsession = null;
+    }
+  }
+
+  stopXvfb() {
+    if (!this.xvfbsession) return;
+    try {
+      this.xvfbsession.stopSync();
+      log('[XVFB] Stopped');
+    } catch (err) {
+      console.error('Failed to stop Xvfb:', err);
+    } finally {
+      this.xvfbsession = null;
+    }
+  }
+
   async ensureBrowser() {
     if (this.browser) return this.browser;
     const installs = await Launcher.getInstallations();
     if (!installs.length) throw new Error('No Chrome found');
     this.chromePath = installs[0];
 
+    const headless = process.platform === 'linux' ? false : true;
+    if (!headless) this.startXvfbIfNeeded();
+
     this.browser = await puppeteer.launch({
       executablePath: this.chromePath,
-      headless: true,
+      headless: headless,
+      turnstile: true,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
-        '--disable-gpu',
-        '--mute-audio',
-        '--disable-web-security',
+        '-window-size=1280,720',
+        // '--disable-dev-shm-usage', // optional for Docker
+        //'--disable-gpu',
+        //'--mute-audio',
+        //'--disable-web-security',
         //'--disable-features=Translate,OptimizationHints,MediaRouter,DialMediaRouteProvider,CalculateNativeWinOcclusion,InterestFeedContentSuggestions,CertificateTransparencyComponentUpdater,AutofillServerCommunication,PrivacySandboxSettings4,AutomationControlled',
         // WebRTC hard-disable
-        '--disable-webrtc',
+        //'--disable-webrtc',
         //'--disable-features=WebRtcHideLocalIpsWithMdns', /* disabled with above */
-        '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
+        //'--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
       ],
       defaultViewport: { width: 1280, height: 720 },
     });
+
+    // Stop Xvfb when browser disconnects
+    this.browser.on('disconnected', () => {
+      try { this.stopXvfb(); } catch {}
+    });
+
     return this.browser;
   }
+
   async newContext() {
     const browser = await this.ensureBrowser();
     if (typeof browser.createIncognitoBrowserContext === 'function') {
@@ -272,18 +359,30 @@ class BrowserManager {
       ? browser.defaultBrowserContext()
       : (browser.defaultBrowserContext || null);
   }
+  
+  async closeBrowser() {
+    if (!this.browser) {
+      // Still stop Xvfb if somehow running without browser
+      this.stopXvfb();
+      return;
+    }
+    try { await this.browser.close(); } catch {}
+    this.browser = null;
+    this.chromePath = null;
+    this.stopXvfb();
+  }
+
 }
 const browserMgr = new BrowserManager();
 
 // Close browser when no sessions remain (optional but recommended)
 async function maybeCloseBrowserIfIdle() {
   if (SESSIONS.size === 0 && browserMgr.browser) {
-    try { await browserMgr.browser.close(); } catch {}
-    browserMgr.browser = null;
-    browserMgr.chromePath = null;
+    await browserMgr.closeBrowser();
     log('[BROWSER] Closed (no active sessions)');
   }
 }
+
 
 // prune by TTL OR idle; run frequently so idle is accurate
 async function pruneSessions() {
@@ -326,16 +425,33 @@ async function createSession({
     ? String(m3u8Match)
     : '';
 
+  // always allow embed url host
+  const embedHost = new URL(embedUrl).host;
+
   // Only block base64 images and off-domain navigations
   await page.setRequestInterception(true);
   page.on('request', (req) => {
     try {
-      const urlStr = req.url();
 
-      // Block inline base64 images (safe for HLS)
-      if (url.startsWith('data:') ||
-          url.startsWith('chrome:') ||
-          url.startsWith('chrome-extension:')) {
+      const urlStr = req.url();
+      
+      // debug log for key uri proxying
+      // if (urlStr.toLowerCase().includes('/key')) {        
+      //   log('[KEY REQ]', {
+      //           method: req.method(),
+      //           url: urlStr,
+      //           headers: req.headers(),
+      //           resourceType: req.resourceType(),
+      //           frameUrl: req.frame()?.url?.() || null,
+      //         });
+      // }
+
+      // Block inline base64 images, chrome and spam urls (safe for HLS)
+      if (urlStr.startsWith('data:') ||
+          urlStr.startsWith('chrome:') ||
+          urlStr.startsWith('chrome-extension:') ||
+          urlStr.includes('amazonaws.com/cam.edu')
+        ) {
         return req.abort();
       }
 
@@ -343,10 +459,15 @@ async function createSession({
       try { host = new URL(urlStr).host; } catch {}
 
       const type = req.resourceType();
-      const isNav = req.isNavigationRequest() || type === 'document';
+      const isDoc = type === 'document' || req.isNavigationRequest();
+      const frame = req.frame();
+      const isMainFrame = frame === page.mainFrame();
+      const isNav = isDoc && isMainFrame;   // true only for top-level doc navigations
+      //log('[REQ] ', urlStr, type, isNav)
 
       // Only block top-level navigations to non-allowlisted hosts
-      if (isNav && !hostMatchesAllowed(host)) {
+      if (isNav && !hostMatchesAllowed(host) && host !== embedHost && !host.endsWith('.' + embedHost)) {
+        //log('!!!BLOCKED!!!')
         return req.abort();
       }
 
@@ -396,6 +517,16 @@ async function createSession({
 
       log('[RESP]', url);
 
+      // dlhd grecaptcha verify response
+      if (url.toLowerCase().includes('/verify')) log('[RESP TEXT]', await res.text());
+
+      // log debug for key uri proxy response
+      // if (url.toLowerCase().includes('/key')) {
+      //   const buf = await res.buffer();
+      //   log('[RESP KEY]', buf.toString('hex'));
+      //   log('[RESP KEY HEADERS]', res.request().headers());
+      // }
+
       const ct = (res.headers()['content-type'] || '').toLowerCase();
 
       // If matchSub is present => ONLY accept URLs that include it.
@@ -415,12 +546,14 @@ async function createSession({
 
       // Capture *actual request headers* Chromium used for this playlist request
       const req = res.request?.();
+      const reqMethod = req?.method?.() || 'UNKNOWN';
       const reqHeaders = req?.headers?.() || {};
       const frameUrl = req?.frame?.()?.url?.() || '';
       const refererHdr = reqHeaders['referer'] || '';
       const originHdr  = reqHeaders['origin']  || '';
 
       requestMeta.set(url, {
+        reqMethod,
         reqHeaders,
         referer: refererHdr,
         origin: originHdr,
@@ -445,8 +578,9 @@ async function createSession({
         for (const resolve of set) resolve(entry);
         waiters.delete(url);
       }
-    } catch {
+    } catch (e) {
       // swallow to avoid unhandled rejections from event handler
+      //if (DEFAULT_LOG_ON) console.error('[RESP_HANDLER_ERROR]', e);
     }
   });
 
@@ -554,6 +688,8 @@ app.get('/playlist', async (req, res) => {
     const embedUrl = req.query.embed?.toString();
     const playlistUrl = req.query.url?.toString();
     const sid = req.query.sid?.toString();
+    
+    // if (playlistUrl) log('[PLAYLIST HIT]', sid, playlistUrl);
 
     // allowlist
     const toCheck = embedUrl || playlistUrl;
@@ -562,6 +698,7 @@ app.get('/playlist', async (req, res) => {
       return;
     }
     const host = new URL(toCheck).host;
+    
     if (ALLOWLIST.length && !ALLOWLIST.includes(host)) {
       res.status(403).send('Origin not allowed by proxy');
       return;
@@ -642,6 +779,7 @@ app.get('/playlist', async (req, res) => {
 
           return {
             url: u,
+            method: meta?.reqMethod || null,
             headers,
             initiator: meta?.frameUrl || null,
           };
@@ -727,7 +865,12 @@ app.get('/playlist', async (req, res) => {
 
     const out = processed.map((line) => {
       if (!line || line.startsWith('#')) {
-        if (line.startsWith('#EXT-X-KEY') || line.startsWith('#EXT-X-MAP')) {
+        if (line.startsWith('#EXT-X-KEY')) {
+          // proxy aes key requests
+          return rewriteExtXKeyUriToProxy(line, baseUrl, req, sid);
+          //return absolutizeKeyOrMapUri(line, baseUrl);
+        }
+        if (line.startsWith('#EXT-X-MAP')) {
           return absolutizeKeyOrMapUri(line, baseUrl);
         }
         return line;
@@ -743,6 +886,78 @@ app.get('/playlist', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).send('Proxy error: ' + (err?.message || String(err)));
+  }
+});
+
+app.get('/key', async (req, res) => {
+  try {
+    
+    const sid = req.query.sid?.toString();
+    const keyUrl = req.query.url?.toString();
+    
+    //log('[KEY HIT]', sid, keyUrl);
+
+    if (!sid || !keyUrl) {
+      res.status(400).send('Missing query param: sid and url');
+      return;
+    }
+
+    // Optional allowlist (recommended)
+    if (ALLOWLIST.length) {
+      const host = new URL(keyUrl).host;
+      if (!ALLOWLIST.includes(host)) {
+        res.status(403).send('Origin not allowed by proxy');
+        return;
+      }
+    }
+
+    const session = getSessionOrThrow(sid);
+    session.lastActivityAt = nowMs();
+
+    // Fetch inside the embed page context, letting Chromium set Referer/Origin naturally
+    let upstream;
+    try {
+      upstream = await session.page.evaluate(async (u) => {
+        const r = await fetch(u, {
+          cache: 'no-store',
+          //credentials: 'include', // send cookies for key host if present
+          mode: 'cors',
+
+        });
+
+        const buf = await r.arrayBuffer();
+        return {
+          status: r.status,
+          type: r.type,
+          headers: Object.fromEntries([...r.headers]),
+          bytes: Array.from(new Uint8Array(buf)),
+        };
+      }, keyUrl);
+    } catch (err) {
+      res.status(502).send('Upstream key fetch failed: ' + (err?.message || String(err)));
+      return;
+    }
+
+    if (!upstream) {
+      res.status(502).send('Empty upstream key response');
+      return;
+    }
+
+    const ct =
+      upstream.headers?.['content-type'] ||
+      upstream.headers?.['Content-Type'] ||
+      'application/octet-stream';
+
+    const body = Buffer.from(upstream.bytes || []);
+
+    res.status(upstream.status || 200)
+      .set('Cache-Control', 'no-store, must-revalidate')
+      .set('Content-Type', ct)
+      .send(body);
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Key proxy error: ' + (err?.message || String(err)));
   }
 });
 
@@ -783,3 +998,63 @@ server.on('clientError', (err, socket) => {
 server.listen(PORT, () => {
   console.log(`Headless HLS playlist resolver and proxy on ${PORT}`);
 });
+
+
+// --- Shutdown and stop Xvfb on shutdown signals
+
+let shuttingDown = false;
+
+async function gracefulShutdown(signal = 'SIGINT') {
+  if (shuttingDown) return;
+  shuttingDown = true;
+
+  console.log(`[SHUTDOWN] Received ${signal}, shutting down...`);
+
+  // 1) Stop accepting new connections
+  try {
+    await new Promise((resolve) => server.close(() => resolve()));
+    console.log('[SHUTDOWN] HTTP server closed');
+  } catch (e) {
+    console.error('[SHUTDOWN] server.close error:', e);
+  }
+
+  // 2) Cleanup all sessions (pages/contexts)
+  try {
+    const sessions = Array.from(SESSIONS.values());
+    await Promise.allSettled(sessions.map(s => s.cleanup?.()));
+    SESSIONS.clear();
+    console.log('[SHUTDOWN] Sessions cleaned up');
+  } catch (e) {
+    console.error('[SHUTDOWN] session cleanup error:', e);
+  }
+
+  // 3) Close browser + stop Xvfb (your BrowserManager.closeBrowser() should stop Xvfb too)
+  try {
+    await browserMgr.closeBrowser?.();
+    console.log('[SHUTDOWN] Browser/Xvfb closed');
+  } catch (e) {
+    console.error('[SHUTDOWN] browser close error:', e);
+    // Fallback: at least attempt Xvfb stop
+    try { browserMgr.stopXvfb?.(); } catch {}
+  }
+
+  // 4) Hard exit after grace period (prevents hanging forever)
+  const forceExitTimer = setTimeout(() => {
+    console.error('[SHUTDOWN] Force exiting after timeout');
+    process.exit(1);
+  }, 5000);
+  forceExitTimer.unref();
+
+  // If you got here, exit normally
+  process.exit(0);
+}
+
+process.once('SIGINT', () => gracefulShutdown('SIGINT'));
+process.once('SIGTERM', () => gracefulShutdown('SIGTERM'));
+
+process.on('exit', () => {
+  try { browserMgr.stopXvfb?.(); } catch {}
+});
+
+
+
