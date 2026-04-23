@@ -36,7 +36,7 @@ export async function getSrc(embedUrl, referer, timeoutMs = 10_000) {
   // Detect .m3u8 anywhere
   page.on('request', (req) => {
     const url = req.url();
-    // console.log('[REQ]', req.resourceType(), url);
+    console.log('[REQ]', req.resourceType(), url);
 
     if (!settled && url.includes('.m3u8')) {
       settled = true;
@@ -84,14 +84,14 @@ export async function getSrc(embedUrl, referer, timeoutMs = 10_000) {
   }
 }
 
-// async function main() {
-//   const x = await getSrc(
-//     //'https://embedsports.top/embed/admin/ppv-vf-b-stuttgart-vs-sc-freiburg/1'
-//     'https://embedsports.top/embed/echo/farmers-insurance-open-pga-tour-tgl-001/1',
-//     'https://streamed.pk/',
-//     15000
-//   );
-//   console.log(x);
-// }
+async function main() {
+  const x = await getSrc(
+    //'https://embedsports.top/embed/admin/ppv-vf-b-stuttgart-vs-sc-freiburg/1'
+    'https://vidfast.pro/movie/tt32357218',
+    'https://vidfast.pro/movie/',
+    15000
+  );
+  console.log(x);
+}
 
-// main();
+main();

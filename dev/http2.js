@@ -114,30 +114,31 @@ export async function getHlsOverH2(url, extraHeaders = {}, timeoutMs = 15000) {
 
 
 
-async function getHLS() {
-  const url = "http://localhost:4000/get?url=https://embedsports.top/embed/echo/mens-t20-world-cup-england-vs-italy-cricket-hundred-1/1&referer=https://streamed.pk";
+// async function getHLS() {
+//   const url = "http://localhost:4000/get?url=https://embedsports.top/embed/echo/mens-t20-world-cup-england-vs-italy-cricket-hundred-1/1&referer=https://streamed.pk";
 
-  const res = await fetch(url, { method: "GET" });
+//   const res = await fetch(url, { method: "GET" });
 
-  if (!res.ok) {
-    throw new Error(`HTTP ${res.status} ${res.statusText}`);
-  }
+//   if (!res.ok) {
+//     throw new Error(`HTTP ${res.status} ${res.statusText}`);
+//   }
 
-  // If you expect text:
-  // const body = await res.text();
-  // console.log(body);
+//   // If you expect text:
+//   // const body = await res.text();
+//   // console.log(body);
 
-  // If you expect JSON, use:
-  const data = await res.json();
-  //console.log(data);
-  return data.src
-}
+//   // If you expect JSON, use:
+//   const data = await res.json();
+//   //console.log(data);
+//   return data.src
+// }
 
-const src = await getHLS();
-console.log(src);
+// const src = await getHLS();
+// console.log(src);
 
 
 // Example usage with top-level await:
+
 const r = await getHlsOverH2(src);
 console.log(r.status);
 console.log(r.body.slice(0, 300));

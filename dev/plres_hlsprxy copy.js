@@ -74,6 +74,7 @@ let ALLOWED_HOSTS = new Set([
   'hexa.su',
   'flixer.su',
   'dlstreams.top',
+  'vidsync.xyz',
   // 'adffdafdsafds.sbs',
   // 'www.google.com',
   // 'www.gstatic.com',
@@ -277,7 +278,7 @@ class BrowserManager {
     this.browser = null;
     this.chromePath = null;
     this.xvfbsession = null;
-    this._launching = null;
+
   }
 
   startXvfbIfNeeded() {
@@ -310,111 +311,55 @@ class BrowserManager {
     }
   }
 
-async ensureBrowser() {
-    // 1. Re-use a healthy cached browser; drop it if the underlying process is gone.
-    if (this.browser) {
-      try {
-        const proc = this.browser.process?.();
-        const connected = this.browser.connected !== false;
-        if (connected && proc && !proc.killed && proc.exitCode === null) {
-          return this.browser;
-        }
-      } catch { /* fall through to relaunch */ }
-      this.browser = null;
-    }
+  async ensureBrowser() {
+    if (this.browser) return this.browser;
+    const installs = await Launcher.getInstallations();
+    if (!installs.length) throw new Error('No Chrome found');
+    this.chromePath = installs[0];
 
-    // 2. Coalesce parallel launches — during recovery, several requests may race
-    //    and without this we'd spawn N Chromiums.
-    if (this._launching) return this._launching;
+    const headless = process.platform === 'linux' ? false : true;
+    if (!headless) this.startXvfbIfNeeded();
 
-    this._launching = (async () => {
-      try {
-        const installs = await Launcher.getInstallations();
-        if (!installs.length) throw new Error('No Chrome found');
-        this.chromePath = installs[0];
+    this.browser = await puppeteer.launch({
+      executablePath: this.chromePath,
+      headless: headless,
+      turnstile: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '-window-size=1280,720',
+        // '--disable-dev-shm-usage', // optional for Docker
+        //'--disable-gpu',
+        //'--mute-audio',
+        //'--disable-web-security',
+        //'--disable-features=Translate,OptimizationHints,MediaRouter,DialMediaRouteProvider,CalculateNativeWinOcclusion,InterestFeedContentSuggestions,CertificateTransparencyComponentUpdater,AutofillServerCommunication,PrivacySandboxSettings4,AutomationControlled',
+        // WebRTC hard-disable
+        //'--disable-webrtc',
+        //'--disable-features=WebRtcHideLocalIpsWithMdns', /* disabled with above */
+        //'--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
+      ],
+      defaultViewport: { width: 1280, height: 720 },
+    });
 
-        const headless = process.platform === 'linux' ? false : true;
-        if (!headless) this.startXvfbIfNeeded();
+    // Stop Xvfb when browser disconnects
+    this.browser.on('disconnected', () => {
+      try { this.stopXvfb(); } catch {}
+    });
 
-        this.browser = await puppeteer.launch({
-          executablePath: this.chromePath,
-          headless,
-          turnstile: true,
-          // Fail fast (default is 180s). If Chromium wedges we want to know in 45s,
-          // not wait three minutes while every new request piles up a 502.
-          protocolTimeout: 45_000,
-          args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            // CRITICAL in Docker: default /dev/shm is 64 MB and Chromium will OOM-crash
-            // on heavier anti-bot pages (Turnstile, JS challenges). Forces /tmp instead.
-            '--disable-dev-shm-usage',
-            '-window-size=1280,720',
-            // ...keep any other args you had here...
-          ],
-          defaultViewport: { width: 1280, height: 720 },
-        });
-
-        // Stop Xvfb AND null the browser ref so the next request relaunches.
-        this.browser.on('disconnected', () => {
-          console.warn('[BROWSER] Disconnected — will relaunch on next request');
-          this.browser = null;
-          try { this.stopXvfb(); } catch {}
-        });
-
-        return this.browser;
-      } finally {
-        this._launching = null;
-      }
-    })();
-
-    return this._launching;
+    return this.browser;
   }
 
   async newContext() {
-    const tryIt = async () => {
-      const browser = await this.ensureBrowser();
-      if (typeof browser.createIncognitoBrowserContext === 'function') {
-        return await browser.createIncognitoBrowserContext();
-      }
-      if (typeof browser.createBrowserContext === 'function') {
-        return await browser.createBrowserContext();
-      }
-      return typeof browser.defaultBrowserContext === 'function'
-        ? browser.defaultBrowserContext()
-        : (browser.defaultBrowserContext || null);
-    };
-
-    try {
-      return await tryIt();
-    } catch (err) {
-      const msg = String(err?.message || err || '');
-      const recoverable =
-        err?.name === 'ProtocolError' ||
-        /timed out|Target closed|Connection closed|Protocol error/i.test(msg);
-      if (!recoverable) throw err;
-
-      console.warn('[BROWSER] newContext failed, force-closing + retrying once:', msg);
-      await this.forceClose();
-      return await tryIt();
+    const browser = await this.ensureBrowser();
+    if (typeof browser.createIncognitoBrowserContext === 'function') {
+      return await browser.createIncognitoBrowserContext();
     }
-  }
-
-  async forceClose() {
-    const b = this.browser;
-    this.browser = null;
-    if (!b) { this.stopXvfb(); return; }
-    try {
-      const proc = b.process?.();
-      await Promise.race([
-        b.close(),
-        new Promise((r) => setTimeout(r, 3000)),
-      ]).catch(() => {});
-      if (proc && !proc.killed && proc.exitCode === null) {
-        try { proc.kill('SIGKILL'); } catch {}
-      }
-    } catch {}
-    this.stopXvfb();
+    if (typeof browser.createBrowserContext === 'function') {
+      return await browser.createBrowserContext();
+    }
+    return typeof browser.defaultBrowserContext === 'function'
+      ? browser.defaultBrowserContext()
+      : (browser.defaultBrowserContext || null);
   }
   
   async closeBrowser() {
