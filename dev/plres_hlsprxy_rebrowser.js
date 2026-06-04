@@ -5,23 +5,20 @@ import dns from 'node:dns';
 import { URL } from 'node:url';
 import crypto from 'node:crypto';
 
-// ✅ CloakBrowser import (drop-in Puppeteer replacement)
-//import { launch } from 'cloakbrowser/puppeteer';
-import { ensureBinary, clearCache, binaryInfo } from 'cloakbrowser';
-import { ensureAndPruneCloakbrowserCache } from './cloakbrowserCache.js';
-
+import puppeteer from 'rebrowser-puppeteer-core';
+import { Launcher } from 'chrome-launcher';
 
 import Xvfb from 'xvfb';
-import { error } from 'node:console';
-import { userInfo } from 'node:os';
 
 // --- Hardening: keep process alive on unexpected async errors ---
 process.on('unhandledRejection', (reason) => {
   console.error('[UNHANDLED_REJECTION]', reason);
+  // Keep running
 });
 
 process.on('uncaughtException', (err) => {
   console.error('[UNCAUGHT_EXCEPTION]', err);
+  // Keep running (you requested not to stop)
 });
 
 // --- Networking defaults ---
@@ -37,30 +34,31 @@ const DEFAULT_LOG_ON =
 function log(...args) {
   if (DEFAULT_LOG_ON) console.log(...args);
 }
-function infoLog(...args) {
-  console.log(...args);
-}
 function warn(...args) {
   if (DEFAULT_LOG_ON) console.warn(...args);
 }
 function errorLog(...args) {
+  // usually keep errors always on; but you can also gate this if you want
   console.error(...args);
 }
 
 // --- Config ---
 const PORT = process.env.PROXY_PORT || 3999;
 
+// Stable UA; override with ?ua=...
 const DEFAULT_UA =
   process.env.UPSTREAM_UA ||
   (process.platform === 'linux'
-    ? 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.7632.159 Safari/537.36'
-    : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36');
+    ? 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.7632.159 Safari/537.36'
+    : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36');
 
+// Optional allowlist (safety)
 const ALLOWLIST = (process.env.ALLOWLIST || '')
   .split(',')
   .map(s => s.trim())
   .filter(Boolean);
 
+// --- Allowed embed + network hosts (match subdomains too) ---
 let ALLOWED_HOSTS = new Set([
   'streamed.pk',
   'embedsports.top',
@@ -77,7 +75,13 @@ let ALLOWED_HOSTS = new Set([
   'flixer.su',
   'dlstreams.top',
   'vidcore.net',
+  // 'adffdafdsafds.sbs',
+  // 'www.google.com',
+  // 'www.gstatic.com',
 ]);
+
+// --- allow all hosts for now
+//ALLOWED_HOSTS = new Set([]);
 
 function hostMatchesAllowed(host) {
   if (!ALLOWED_HOSTS || ALLOWED_HOSTS.size === 0) return true;
@@ -94,12 +98,14 @@ function hostMatchesAllowed(host) {
 function isAbsoluteUrl(u = '') { return /^https?:\/\//i.test(u); }
 function toAbsolute(base, rel) { return new URL(rel, base).toString(); }
 
+// truthy parsing for resolve switch
 function isTruthy(v) {
   if (v == null) return false;
   const s = String(v).trim().toLowerCase();
   return s === '1' || s === 'true' || s === 'yes' || s === 'y' || s === 'on';
 }
 
+// format cookies as Cookie request header
 function cookiesToHeader(cookies = []) {
   return cookies
     .filter(c => c?.name && c?.value)
@@ -107,6 +113,7 @@ function cookiesToHeader(cookies = []) {
     .join('; ');
 }
 
+// records count for resolve_only mode (clamped 1..20)
 function parseRecordsCount(req, def = 1) {
   const raw = req.query.records;
   const n = Number(raw);
@@ -130,15 +137,18 @@ function isMasterPlaylist(lines) {
   return lines.some(ln => ln.startsWith('#EXT-X-STREAM-INF') || ln.startsWith('#EXT-X-MEDIA'));
 }
 
+/** Build the canonical sid URLs for a playlist and key uri we want the player to use */
 function buildSidPlaylistUrl(req, absoluteTargetUrl, sid) {
   const params = new URLSearchParams();
   params.set('url', absoluteTargetUrl);
   params.set('sid', sid);
 
+  // Forward useful params that influence upstream behavior (optional)
+  // + forward idle settings through redirect so the player keeps them
   const q = req.query || {};
   const forwardList = [
     'ua', 'referer', 'origin', 'accept', 'accept_language', 'accept_encoding', 'authorization',
-    'idle', 'idle_ms',
+    'idle', 'idle_ms', // per-session idle timeout forwarded through 302
   ];
 
   for (const k of forwardList) {
@@ -158,6 +168,7 @@ function buildSidKeyUrl(req, absoluteKeyUrl, sid) {
   params.set('url', absoluteKeyUrl);
   params.set('sid', sid);
 
+  // Only forward idle controls (optional)
   const q = req.query || {};
   if (q.idle_ms != null && q.idle_ms !== '') params.set('idle_ms', String(q.idle_ms));
   else if (q.idle != null && q.idle !== '') params.set('idle', String(q.idle));
@@ -165,6 +176,9 @@ function buildSidKeyUrl(req, absoluteKeyUrl, sid) {
   return `${req.protocol}://${req.get('host')}/key?${params.toString()}`;
 }
 
+/** Rewrite MASTER playlists to point variant/media playlists back to this proxy with the same sid.
+ *  TS segments are NOT rewritten.
+ */
 function rewriteMasterPlaylist(lines, baseUrl, req, sid) {
   const out = [];
   for (let i = 0; i < lines.length; i++) {
@@ -199,6 +213,7 @@ function rewriteMasterPlaylist(lines, baseUrl, req, sid) {
   return out;
 }
 
+/* Rewrite #EXT-X-KEY to proxy */
 function rewriteExtXKeyUriToProxy(line, baseUrl, req, sid) {
   if (!line.startsWith('#EXT-X-KEY')) return line;
 
@@ -207,6 +222,7 @@ function rewriteExtXKeyUriToProxy(line, baseUrl, req, sid) {
   const raw = (m[2] || m[3] || '').trim();
   if (!raw) return line;
 
+  // Make absolute against playlist base URL
   const abs = isAbsoluteUrl(raw) ? raw : toAbsolute(baseUrl, raw);
   if (!/^https?:\/\//i.test(abs)) return line;
 
@@ -214,7 +230,7 @@ function rewriteExtXKeyUriToProxy(line, baseUrl, req, sid) {
   return line.replace(/URI=("([^"]+)"|([^,]+))/i, `URI="${proxied}"`);
 }
 
-// ------------- Session Store -------------
+// ------------- Session Store (single page per sid) -------------
 const SESSIONS = new Map();  // sid -> session
 
 // Session and browser cleanup
@@ -231,6 +247,12 @@ function clamp(n, min, max) {
   return Math.max(min, Math.min(max, n));
 }
 
+/**
+ * Parse per-session idle timeout from request query:
+ * - idle_ms=<milliseconds> has priority
+ * - idle=<seconds> is also supported
+ * - returns DEFAULT_IDLE_MS if not provided or invalid
+ */
 function parseIdleMs(req) {
   const q = req.query || {};
 
@@ -250,85 +272,86 @@ function parseIdleMs(req) {
 function nowMs() { return Date.now(); }
 function newSid() { return crypto.randomUUID(); }
 
-// ------------- Browser Manager (CloakBrowser) -------------
-// ------------- Browser Manager (SINGLE BROWSER ONLY) -------------
+// ------------- Browser Manager -------------
 class BrowserManager {
   constructor() {
     this.browser = null;
+    this.chromePath = null;
     this.xvfbsession = null;
-    this._launchPromise = null;
+    this._launching = null;
   }
 
-  // SAFE FALLBACK: Only starts Xvfb if not already running
-  ensureXvfb() {
-  if (process.platform !== 'linux') return;
-  if (this.xvfbsession) return;
+  startXvfbIfNeeded() {
+    // You want non-headless on Linux, so Xvfb should start on Linux.
+    if (process.platform !== 'linux') return;
+    if (this.xvfbsession) return;
 
-  // If globalXvfb exists or DISPLAY is set, assume Xvfb is already running
-  if (globalXvfb || process.env.DISPLAY) {
-    log('[XVFB] Using existing display.');
-    return;
-  }
-
-  try {
-    this.xvfbsession = new Xvfb({
-      silent: true,
-      xvfb_args: ['-screen', '0', '1920x1080x24', '-ac', '-nolisten', 'tcp'],
-    });
-    this.xvfbsession.startSync();
-    infoLog('[BROWSER] Xvfb started on display:', process.env.DISPLAY || ':99');
-  } catch (err) {
-    if (err.message.includes('already in use') || err.message.includes('locked')) {
-      infoLog('[XVFB] Display already running, skipping fallback.');
-    } else {
-      errorLog('[BROWSER] ⚠️ Xvfb failed to start:', err.message);
-      // Don't throw — let CloakBrowser attempt headless as last resort
+    try {
+      this.xvfbsession = new Xvfb({
+        silent: true,
+        xvfb_args: ['-screen', '0', '1920x1080x24', '-ac'],
+      });
+      this.xvfbsession.startSync();
+      log('[XVFB] Started');
+    } catch (err) {
+      console.error('Xvfb start error:', err?.message || err);
+      this.xvfbsession = null;
     }
-    this.xvfbsession = null;
   }
-}
 
   stopXvfb() {
     if (!this.xvfbsession) return;
-    try { this.xvfbsession.stopSync(); console.log('[XVFB] Stopped.'); } 
-    catch (err) { console.warn('[XVFB] Stop failed:', err.message); }
-    finally { this.xvfbsession = null; }
+    try {
+      this.xvfbsession.stopSync();
+      log('[XVFB] Stopped');
+    } catch (err) {
+      console.error('Failed to stop Xvfb:', err);
+    } finally {
+      this.xvfbsession = null;
+    }
   }
 
-  async ensureBrowser() {
-    // Reuse existing healthy browser
-    if (this.browser?.connected && this.browser?.process?.()?.exitCode === null) {
-      return this.browser;
+async ensureBrowser() {
+    // 1. Re-use a healthy cached browser; drop it if the underlying process is gone.
+    if (this.browser) {
+      try {
+        const proc = this.browser.process?.();
+        const connected = this.browser.connected !== false;
+        if (connected && proc && !proc.killed && proc.exitCode === null) {
+          return this.browser;
+        }
+      } catch { /* fall through to relaunch */ }
+      this.browser = null;
     }
 
-    // Coalesce parallel launches
-    if (this._launchPromise) return this._launchPromise;
+    // 2. Coalesce parallel launches — during recovery, several requests may race
+    //    and without this we'd spawn N Chromiums.
+    if (this._launching) return this._launching;
 
-    this._launchPromise = (async () => {
+    this._launching = (async () => {
       try {
-        // Clean up any zombie browser first
-        if (this.browser) {
-          try { await this.browser.close(); } catch {}
-          this.browser = null;
-        }
+        const installs = await Launcher.getInstallations();
+        if (!installs.length) throw new Error('No Chrome found');
+        this.chromePath = installs[0];
 
         const headless = process.platform === 'linux' ? false : true;
-        if (!headless) this.ensureXvfb();
+        if (!headless) this.startXvfbIfNeeded();
 
-        // Launch with working-script settings
-        this.browser = await (await import('cloakbrowser/puppeteer')).launch({
+        this.browser = await puppeteer.launch({
+          executablePath: this.chromePath,
           headless,
-          humanize: true,
-          geoip: true,
-          humanPreset: 'careful',  // ✅ Critical for stability
+          turnstile: true,
+          // Fail fast (default is 180s). If Chromium wedges we want to know in 45s,
+          // not wait three minutes while every new request piles up a 502.
           protocolTimeout: 45_000,
           args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
+            // CRITICAL in Docker: default /dev/shm is 64 MB and Chromium will OOM-crash
+            // on heavier anti-bot pages (Turnstile, JS challenges). Forces /tmp instead.
             '--disable-dev-shm-usage',
-            '--disable-gpu',
             '-window-size=1280,720',
-            '--fingerprint=12345',  // ✅ Fixed fingerprint prevents conflicts
+            // ...keep any other args you had here...
           ],
           defaultViewport: { width: 1280, height: 720 },
         });
@@ -342,11 +365,11 @@ class BrowserManager {
 
         return this.browser;
       } finally {
-        this._launchPromise = null;
+        this._launching = null;
       }
     })();
 
-    return this._launchPromise;
+    return this._launching;
   }
 
   async newContext() {
@@ -379,28 +402,38 @@ class BrowserManager {
   }
 
   async forceClose() {
-    if (!this.browser) { this.stopXvfb(); return; }
-    try {
-      await Promise.race([
-        this.browser.close(),
-        new Promise(r => setTimeout(r, 3000)),
-      ]);
-    } catch {}
+    const b = this.browser;
     this.browser = null;
+    if (!b) { this.stopXvfb(); return; }
+    try {
+      const proc = b.process?.();
+      await Promise.race([
+        b.close(),
+        new Promise((r) => setTimeout(r, 3000)),
+      ]).catch(() => {});
+      if (proc && !proc.killed && proc.exitCode === null) {
+        try { proc.kill('SIGKILL'); } catch {}
+      }
+    } catch {}
     this.stopXvfb();
   }
-
+  
   async closeBrowser() {
-    if (this.browser) {
-      try { await this.browser.close(); } catch {}
-      this.browser = null;
+    if (!this.browser) {
+      // Still stop Xvfb if somehow running without browser
+      this.stopXvfb();
+      return;
     }
+    try { await this.browser.close(); } catch {}
+    this.browser = null;
+    this.chromePath = null;
     this.stopXvfb();
   }
-}
 
+}
 const browserMgr = new BrowserManager();
 
+// Close browser when no sessions remain (optional but recommended)
 async function maybeCloseBrowserIfIdle() {
   if (SESSIONS.size === 0 && browserMgr.browser) {
     await browserMgr.closeBrowser();
@@ -408,13 +441,14 @@ async function maybeCloseBrowserIfIdle() {
   }
 }
 
+
+// prune by TTL OR idle; run frequently so idle is accurate
 async function pruneSessions() {
   const t = nowMs();
-  
   for (const [sid, s] of SESSIONS.entries()) {
     const ageMs = t - (s.createdAt || 0);
     const idleMs = t - (s.lastActivityAt || s.createdAt || 0);
-    const idleLimit = s.idleMs ?? DEFAULT_IDLE_MS;
+    const idleLimit = s.idleMs ?? DEFAULT_IDLE_MS; // per-session idle
 
     if (ageMs > SESSION_TTL_MS || idleMs > idleLimit) {
       try { await s.cleanup?.(); } catch {}
@@ -427,42 +461,56 @@ async function pruneSessions() {
 
 setInterval(() => {
   pruneSessions().catch(() => {});
-}, 15_000).unref();
+}, 10_000).unref(); // every 10s
 
 async function createSession({
   embedUrl, referer, origin, ua, idleMs, m3u8Match,
-  collectCount = 1,
-  timeoutMs = 15_000
+  collectCount = 1, // number of matching URLs to collect for resolve_only
+  timeoutMs = 15000
 }) {
   const ctx = await browserMgr.newContext();
   const page = await ctx.newPage();
 
+  // --- Hardening: capture page-level errors (do not crash process) ---
   page.on('error', (e) => console.error('[PAGE_ERROR]', e));
   page.on('pageerror', (e) => console.error('[PAGE_PAGEERROR]', e));
 
   await page.setUserAgent(ua || DEFAULT_UA);
   await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
 
+  // optional substring; when present it becomes the ONLY match condition
   const matchSub = (m3u8Match != null && String(m3u8Match).trim() !== '')
     ? String(m3u8Match)
     : '';
 
+  // always allow embed url host
   const embedHost = new URL(embedUrl).host;
 
+  // Only block base64 images and off-domain navigations
   await page.setRequestInterception(true);
   page.on('request', (req) => {
     try {
+
       const urlStr = req.url();
       
+      // debug log for key uri proxying
+      // if (urlStr.toLowerCase().includes('/key')) {        
+      //   log('[KEY REQ]', {
+      //           method: req.method(),
+      //           url: urlStr,
+      //           headers: req.headers(),
+      //           resourceType: req.resourceType(),
+      //           frameUrl: req.frame()?.url?.() || null,
+      //         });
+      // }
+
+      // Block inline base64 images, chrome and spam urls (safe for HLS)
       if (urlStr.startsWith('data:') ||
           urlStr.startsWith('chrome:') ||
           urlStr.startsWith('chrome-extension:') ||
           urlStr.includes('amazonaws.com/cam.edu') ||
           urlStr.includes('ads') ||
-          urlStr.includes('google-') ||
-          urlStr.includes('wsrv.nl') ||
-          urlStr.includes('deuxseethe') ||
-          urlStr.includes('unwrapsstow')
+          urlStr.includes('wsrv.nl')
         ) {
         return req.abort();
       }
@@ -474,9 +522,12 @@ async function createSession({
       const isDoc = type === 'document' || req.isNavigationRequest();
       const frame = req.frame();
       const isMainFrame = frame === page.mainFrame();
-      const isNav = isDoc && isMainFrame;
+      const isNav = isDoc && isMainFrame;   // true only for top-level doc navigations
+      //log('[REQ] ', urlStr, type, isNav)
 
+      // Only block top-level navigations to non-allowlisted hosts
       if (isNav && !hostMatchesAllowed(host) && host !== embedHost && !host.endsWith('.' + embedHost)) {
+        //log('!!!BLOCKED!!!')
         return req.abort();
       }
 
@@ -486,9 +537,14 @@ async function createSession({
     }
   });
 
-  const cache = new Map();
-  const waiters = new Map();
-  const requestMeta = new Map();
+  // Passive playlist capture (no fetch/CDP)
+  const cache = new Map();   // url -> { text, status, headers, ts }
+  const waiters = new Map(); // url -> Set(resolveFn)
+
+  // store actual request headers for each playlist URL (referer/origin etc.)
+  const requestMeta = new Map(); // url -> { reqHeaders, referer, origin, frameUrl, ts }
+
+  // Collect up to collectCount matching URLs (deduped), in the order seen
   const collectedUrls = [];
   const seenUrls = new Set();
   let collectedResolve;
@@ -505,27 +561,37 @@ async function createSession({
     }
   }
 
+  // Promise to get first playlist quickly
   let firstResolve;
   const firstPromise = new Promise((r) => (firstResolve = r));
 
+  // Single response handler: detect m3u8, capture body once, capture real request headers
   page.on('response', async (res) => {
     try {
       const url = res.url();
 
+      // ignore data:* and chrome*
       if (url.startsWith('data:') ||
           url.startsWith('chrome:') ||
           url.includes('ads') ||
           url.startsWith('chrome-extension:')) return;
 
-      const rq = res.request();
-      //console.log(`[${rq.method()}] ${url} ${res.status()}`);
-      log(`[${rq.method()}]`, url, res.status());
+      log('[RESP]', url, res.status());
 
-
+      // dlhd grecaptcha verify response
       if (url.toLowerCase().includes('/verify')) log('[RESP TEXT]', await res.text());
+
+      // log debug for key uri proxy response
+      // if (url.toLowerCase().includes('/key')) {
+      //   const buf = await res.buffer();
+      //   log('[RESP KEY]', buf.toString('hex'));
+      //   log('[RESP KEY HEADERS]', res.request().headers());
+      // }
 
       const ct = (res.headers()['content-type'] || '').toLowerCase();
 
+      // If matchSub is present => ONLY accept URLs that include it.
+      // Else => fallback to standard m3u8 detection.
       const isM3U8 = matchSub
         ? url.includes(matchSub)
         : (
@@ -536,8 +602,10 @@ async function createSession({
 
       if (!isM3U8) return;
 
+      // collect candidate URL(s) for resolve_only records mode
       collectUrl(url);
 
+      // Capture *actual request headers* Chromium used for this playlist request
       const req = res.request?.();      
       const reqMethod = req?.method?.() || 'UNKNOWN';
       const reqHeaders = req?.headers?.() || {};
@@ -558,22 +626,27 @@ async function createSession({
         ts: nowMs(),
       });
 
+      // Read body once
       const text = await res.text();
+      //if (url.toLowerCase().includes('/gaizda/')) log('[RESP TEXT]', await res.text());
       const entry = { text, status: res.status(), headers: res.headers(), ts: nowMs() };
       cache.set(url, entry);
 
+      // Resolve first playlist once
       if (firstResolve) {
         firstResolve({ url, ...entry });
         firstResolve = null;
       }
 
+      // Wake waiters
       const set = waiters.get(url);
       if (set && set.size) {
         for (const resolve of set) resolve(entry);
         waiters.delete(url);
       }
     } catch (e) {
-      // swallow
+      // swallow to avoid unhandled rejections from event handler
+      //if (DEFAULT_LOG_ON) console.error('[RESP_HANDLER_ERROR]', e);
     }
   });
 
@@ -582,17 +655,17 @@ async function createSession({
   const session = {
     sid,
     ctx,
-    page,
+    page,       // embed page (never navigate away)
     embedUrl,
     referer,
-    origin,
+    origin, // store origin for resolve headers output
     ua: ua || DEFAULT_UA,
     createdAt: nowMs(),
-    lastActivityAt: nowMs(),
-    idleMs: idleMs || DEFAULT_IDLE_MS,
+    lastActivityAt: nowMs(), // activity timestamp
+    idleMs: idleMs || DEFAULT_IDLE_MS, // per-session idle timeout
     cache,
     waiters,
-    requestMeta,
+    requestMeta, //request headers etc.
 
     async waitForUrl(url, timeoutMsWait = 10000) {
       const existing = cache.get(url);
@@ -623,17 +696,20 @@ async function createSession({
   const deadline = nowMs() + timeoutMs;
   const timeLeft = () => Math.max(0, deadline - nowMs());
 
+  // Go to the EMBED page (with referer) and wait for first playlist capture
   await page.goto(embedUrl, {
     waitUntil: 'domcontentloaded',
     ...(referer ? { referer } : {}),
     timeout: timeLeft(),
   }).catch(() => {});
 
+  // Wait a bounded time for first playlist
   const firstPlaylist = await Promise.race([
     firstPromise,
     new Promise((r) => setTimeout(() => r(null), timeLeft())),
   ]);
 
+  // If collectCount > 1, wait (within the same deadline) for enough URLs or timeout
   if (collectCount > 1) {
     await Promise.race([
       collectedPromise,
@@ -651,8 +727,9 @@ function getSessionOrThrow(sid) {
   const t = nowMs();
   const ageMs = t - (s.createdAt || 0);
   const idleMs = t - (s.lastActivityAt || s.createdAt || 0);
-  const idleLimit = s.idleMs ?? DEFAULT_IDLE_MS;
+  const idleLimit = s.idleMs ?? DEFAULT_IDLE_MS; // per-session idle
 
+  // enforce TTL + idle immediately (not only in background prune)
   if (ageMs > SESSION_TTL_MS || idleMs > idleLimit) {
     try { s.cleanup?.(); } catch {}
     SESSIONS.delete(sid);
@@ -679,6 +756,9 @@ app.get('/playlist', async (req, res) => {
     const playlistUrl = req.query.url?.toString();
     const sid = req.query.sid?.toString();
     
+    // if (playlistUrl) log('[PLAYLIST HIT]', sid, playlistUrl);
+
+    // allowlist
     const toCheck = embedUrl || playlistUrl;
     if (!toCheck) {
       res.status(400).send('Missing query param: embed or url');
@@ -695,10 +775,17 @@ app.get('/playlist', async (req, res) => {
     const referer = req.query.referer?.toString() || process.env.UPSTREAM_REFERER || '';
     const origin = req.query.origin?.toString() || process.env.UPSTREAM_ORIGIN || '';
 
+    // ---- Warm-up from embed: respond with 302 to sid URL (or resolve-only JSON) ----
     if (embedUrl && !sid) {
-      const resolveOnly = isTruthy(req.query.resolve_only);
-      const idleMs = parseIdleMs(req);
+      const resolveOnly =
+        // isTruthy(req.query.resolve) ||
+        isTruthy(req.query.resolve_only);
+      // || isTruthy(req.query.url_only);
+
+      const idleMs = parseIdleMs(req); // per-session idle config
       const m3u8Match = req.query.m3u8_match?.toString() || '';
+
+      // how many records to return in resolve_only mode (clamped 1..20)
       const recordsCount = resolveOnly ? parseRecordsCount(req, 1) : 1;
 
       const { sid: newSid, session, firstPlaylist, collectedUrls } = await createSession({
@@ -706,15 +793,18 @@ app.get('/playlist', async (req, res) => {
         idleMs,
         m3u8Match,
         collectCount: recordsCount,
-        timeoutMs: 45_000,
+        timeoutMs: 15000,
       });
 
+      // resolve-only mode: ALWAYS return records array
       if (resolveOnly) {
+        // Prefer collected URLs; if none, fall back to firstPlaylist if available
         const urls = (collectedUrls && collectedUrls.length)
           ? collectedUrls
           : (firstPlaylist?.url ? [firstPlaylist.url] : []);
 
         if (!urls.length) {
+          // cleanup on failure
           try { await session.cleanup?.(); } catch {}
           try { SESSIONS.delete(newSid); } catch {}
           await maybeCloseBrowserIfIdle();
@@ -726,6 +816,7 @@ app.get('/playlist', async (req, res) => {
           return;
         }
 
+        // Build records with per-URL cookie headers + actual referer/origin from Chromium request
         const records = await Promise.all(urls.slice(0, recordsCount).map(async (u) => {
           let playlistCookies = [];
           try { playlistCookies = await session.page.cookies(u); } catch {}
@@ -735,12 +826,19 @@ app.get('/playlist', async (req, res) => {
           const realReferer = meta?.referer || session.referer || '';
           const realOrigin  = meta?.origin  || session.origin  || '';
 
+          // Start from Chromium's actual request header set,
           const base = meta?.reqHeaders ? { ...meta.reqHeaders } : {};
 
           const headers = {
             ...base,
+            // normalize/override if needed
+            // 'User-Agent': session.ua,
+            // ...(realReferer ? { 'Referer': realReferer } : {}),
+            // ...(realOrigin  ? { 'Origin':  realOrigin  } : {}),
+            // ...(cookieHeader ? { 'Cookie': cookieHeader } : {}),
           };
 
+          // Avoid forwarding problematic hop-by-hop/derived headers
           delete headers['host'];
           delete headers['Host'];
           delete headers['content-length'];
@@ -755,6 +853,7 @@ app.get('/playlist', async (req, res) => {
           };
         }));
 
+        // close session + browser (if no sessions remain)
         try { await session.cleanup?.(); } catch {}
         SESSIONS.delete(newSid);
         await maybeCloseBrowserIfIdle();
@@ -765,7 +864,9 @@ app.get('/playlist', async (req, res) => {
         return;
       }
 
+      // Redirect mode requires a first playlist URL
       if (!firstPlaylist?.url) {
+        // cleanup session on firstPlaylist failure to avoid leaks
         try { await session.cleanup?.(); } catch {}
         try { SESSIONS.delete(newSid); } catch {}
         await maybeCloseBrowserIfIdle();
@@ -786,14 +887,18 @@ app.get('/playlist', async (req, res) => {
       return;
     }
 
+    // ---- Reloads on the same session: serve fresh upstream playlist ----
     if (!sid || !playlistUrl) {
       res.status(400).send('Missing query param: sid and url');
       return;
     }
 
     const session = getSessionOrThrow(sid);
+
+    // activity mark (this is what the idle timeout is based on)
     session.lastActivityAt = nowMs();
 
+    // Make the headless browser fetch the playlist directly
     let upstream;
     try {
       upstream = await session.page.evaluate(async (u) => {
@@ -816,18 +921,22 @@ app.get('/playlist', async (req, res) => {
       return;
     }
 
+    // Process the playlist exactly like before
     const baseUrl = playlistUrl;
     const lines = upstream.text.split(/\r?\n/);
 
     let processed = lines;
     if (isMasterPlaylist(lines)) {
       processed = rewriteMasterPlaylist(lines, baseUrl, req, sid);
+      // res.set('X-Notice', 'Master playlist rewritten');
     }
 
     const out = processed.map((line) => {
       if (!line || line.startsWith('#')) {
         if (line.startsWith('#EXT-X-KEY')) {
+          // proxy aes key requests
           return rewriteExtXKeyUriToProxy(line, baseUrl, req, sid);
+          //return absolutizeKeyOrMapUri(line, baseUrl);
         }
         if (line.startsWith('#EXT-X-MAP')) {
           return absolutizeKeyOrMapUri(line, baseUrl);
@@ -850,14 +959,18 @@ app.get('/playlist', async (req, res) => {
 
 app.get('/key', async (req, res) => {
   try {
+    
     const sid = req.query.sid?.toString();
     const keyUrl = req.query.url?.toString();
     
+    //log('[KEY HIT]', sid, keyUrl);
+
     if (!sid || !keyUrl) {
       res.status(400).send('Missing query param: sid and url');
       return;
     }
 
+    // Optional allowlist (recommended)
     if (ALLOWLIST.length) {
       const host = new URL(keyUrl).host;
       if (!ALLOWLIST.includes(host)) {
@@ -869,12 +982,15 @@ app.get('/key', async (req, res) => {
     const session = getSessionOrThrow(sid);
     session.lastActivityAt = nowMs();
 
+    // Fetch inside the embed page context, letting Chromium set Referer/Origin naturally
     let upstream;
     try {
       upstream = await session.page.evaluate(async (u) => {
         const r = await fetch(u, {
           cache: 'no-store',
+          //credentials: 'include', // send cookies for key host if present
           mode: 'cors',
+
         });
 
         const buf = await r.arrayBuffer();
@@ -913,6 +1029,7 @@ app.get('/key', async (req, res) => {
   }
 });
 
+// Optional: explicit session close
 app.get('/session/close', async (req, res) => {
   try {
     const sid = req.query.sid?.toString();
@@ -931,104 +1048,81 @@ app.get('/session/close', async (req, res) => {
   }
 });
 
-// ------------- App Init & Lifecycle -------------
+// Start server
+const server = http.createServer(app);
 
-// ---------- One-time cache prep ----------
-let preparedPromise = null;
-function prepareOnce() {
-  // Promise-based "once" is concurrency-safe: multiple callers share the same in-flight promise.
-  if (!preparedPromise) {
-    preparedPromise = (async () => {
-      try {
-        await ensureAndPruneCloakbrowserCache({ syncUpdateAtStartup: true });
-        console.log('[INIT] Cloakbrowser cache prepared');
-      } catch (e) {
-        console.warn('[INIT] Cloakbrowser cache prune skipped:', e?.message || e);
-      }
-    })();
-  }
-  return preparedPromise;
-}
-
-let globalXvfb = null;
-
-async function initApp() {
-  infoLog('[INIT] Starting up ...')
-
-  // Check / Download CloakBrowser Binary (Runtime only, keeps Docker image small)
-  // const info = binaryInfo();
-  // infoLog(`[INIT] CloakBrowser binary: installed=${info.installed}, version=${info.version || 'unknown'}`);
-  
-  // if (!info.installed) {
-  //   infoLog('[INIT] Binary missing. Downloading now... (this may take 30-60s depending on network)');
-  //   await ensureBinary();
-  //   infoLog('[INIT] ✅ Binary downloaded successfully.');
-  // }
-  await prepareOnce();
-
-  // Start Xvfb Synchronously on Linux (Guaranteed before server listens)
-  if (process.platform === 'linux') {
-    //console.log('[INIT] Starting Xvfb...');
-    try {
-      globalXvfb = new Xvfb({
-        silent: true,
-        xvfb_args: ['-screen', '0', '1920x1080x24', '-ac', '-nolisten', 'tcp'],
-      });
-      globalXvfb.startSync();
-      infoLog('[INIT] Xvfb started on display:', process.env.DISPLAY || ':99');
-    } catch (err) {     
-      // Option A: Fallback to headless mode if Xvfb fails (keeps server running)
-      if (err.message.includes('already in use') || err.message.includes('locked')) {
-        infoLog('[INIT] Display already running, proceeding with existing Xvfb.');
-        globalXvfb = null; // Don't try to stop something we didn't start
-      } 
-      // Option B: Fatal exit if headful is required (recommended for CloakBrowser stealth)
-      else {
-        console.error('[INIT] ⚠️ Xvfb failed to start:', err.message);
-        process.exit(1);
-      }
-    }
-  }
-
-  // Start Express Server
-  const server = http.createServer(app);
-  server.on('error', (err) => console.error('[SERVER_ERROR]', err));
-  server.on('clientError', (err, socket) => {
-    console.error('[CLIENT_ERROR]', err?.message || err);
-    try { socket.end('HTTP/1.1 400 Bad Request\r\n\r\n'); } catch {}
-  });
-
-  server.listen(PORT, () => {
-    infoLog(`[APP] HLS playlist resolver and proxy listening on ${PORT}`);
-  });
-
-  // Attach Graceful Shutdown
-  attachShutdownHandlers(server);
-}
-
-function attachShutdownHandlers(server) {
-  let shuttingDown = false;
-
-  async function gracefulShutdown(signal = 'SIGINT') {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    infoLog(`[SHUTDOWN] Received ${signal}, cleaning up...`);
-
-    try { await new Promise(r => server.close(r)); } catch {}
-    try { await Promise.allSettled(Array.from(SESSIONS.values()).map(s => s.cleanup?.())); } catch {}
-    try { await browserMgr.closeBrowser(); } catch {}
-    try { if (globalXvfb) { globalXvfb.stopSync(); log('[SHUTDOWN] Xvfb stopped'); } } catch {}
-
-    process.exit(0);
-  }
-
-  process.once('SIGINT', () => gracefulShutdown('SIGINT'));
-  process.once('SIGTERM', () => gracefulShutdown('SIGTERM'));
-  process.on('exit', () => { try { globalXvfb?.stopSync(); } catch {} });
-}
-
-// Run initialization (replaces direct server.listen())
-initApp().catch(err => {
-  console.error('[INIT] Fatal startup error:', err);
-  process.exit(1);
+// --- Hardening: keep server alive on low-level HTTP errors ---
+server.on('error', (err) => {
+  console.error('[SERVER_ERROR]', err);
 });
+
+server.on('clientError', (err, socket) => {
+  console.error('[CLIENT_ERROR]', err?.message || err);
+  try {
+    socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
+  } catch {}
+});
+
+server.listen(PORT, () => {
+  console.log(`Headless HLS playlist resolver and proxy on ${PORT}`);
+});
+
+
+// --- Shutdown and stop Xvfb on shutdown signals
+
+let shuttingDown = false;
+
+async function gracefulShutdown(signal = 'SIGINT') {
+  if (shuttingDown) return;
+  shuttingDown = true;
+
+  console.log(`[SHUTDOWN] Received ${signal}, shutting down...`);
+
+  // 1) Stop accepting new connections
+  try {
+    await new Promise((resolve) => server.close(() => resolve()));
+    console.log('[SHUTDOWN] HTTP server closed');
+  } catch (e) {
+    console.error('[SHUTDOWN] server.close error:', e);
+  }
+
+  // 2) Cleanup all sessions (pages/contexts)
+  try {
+    const sessions = Array.from(SESSIONS.values());
+    await Promise.allSettled(sessions.map(s => s.cleanup?.()));
+    SESSIONS.clear();
+    console.log('[SHUTDOWN] Sessions cleaned up');
+  } catch (e) {
+    console.error('[SHUTDOWN] session cleanup error:', e);
+  }
+
+  // 3) Close browser + stop Xvfb (your BrowserManager.closeBrowser() should stop Xvfb too)
+  try {
+    await browserMgr.closeBrowser?.();
+    console.log('[SHUTDOWN] Browser/Xvfb closed');
+  } catch (e) {
+    console.error('[SHUTDOWN] browser close error:', e);
+    // Fallback: at least attempt Xvfb stop
+    try { browserMgr.stopXvfb?.(); } catch {}
+  }
+
+  // 4) Hard exit after grace period (prevents hanging forever)
+  const forceExitTimer = setTimeout(() => {
+    console.error('[SHUTDOWN] Force exiting after timeout');
+    process.exit(1);
+  }, 5000);
+  forceExitTimer.unref();
+
+  // If you got here, exit normally
+  process.exit(0);
+}
+
+process.once('SIGINT', () => gracefulShutdown('SIGINT'));
+process.once('SIGTERM', () => gracefulShutdown('SIGTERM'));
+
+process.on('exit', () => {
+  try { browserMgr.stopXvfb?.(); } catch {}
+});
+
+
+

@@ -1,6 +1,6 @@
 # s.....d.... puppy #7
 
-Extracts hls playlist urls from some sites using JW Player bundle_jw.js and provider.hls.js and proxies playlist.
+Extracts hls playlist urls from some sites using JW Player bundle_jw.js, provider.hls.js or similar and proxies playlist.
 
 
 

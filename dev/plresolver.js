@@ -13,7 +13,7 @@ export async function getSrc(embedUrl, referer, timeoutMs = 10_000) {
 
   const browser = await puppeteer.launch({
     executablePath: chromePath,
-    headless: true,
+    headless: false,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',

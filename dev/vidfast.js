@@ -110,8 +110,8 @@ export async function getUris(
 // Example usage
 async function main() {
   const result = await getUris(
-    'https://vidfast.pro/movie/533535',
-    'https://vidfast.pro/',
+        'https://vidcore.net/tv/224941/1/1',
+    'https://vidcore.net/',
     '/hezushon/',
     15000
   );

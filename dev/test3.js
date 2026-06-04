@@ -1,211 +1,130 @@
-import dns from 'node:dns';
-import { URL } from 'node:url';
 import puppeteer from 'rebrowser-puppeteer-core';
 import { Launcher } from 'chrome-launcher';
+import crypto from 'crypto';
 
-dns.setDefaultResultOrder('ipv4first');
+const TARGET_URL = 'https://vidcore.net/tv/224941/1/1';
+const USER_AGENT =
+  process.platform === 'linux'
+    ? 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36'
+    : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36';
 
-const DEFAULT_UA =
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36';
 
-function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
-}
+//--------------------------------------------
+// MAIN
+//--------------------------------------------
+(async () => {
 
-/**
- * Resolve the /gaizda/ API call by intercepting it inside Chromium.
- * No fetch(), no external replay.
- */
-export async function resolveGaizda(embedUrl, {
-  timeoutMs = 20000,
-  ua = DEFAULT_UA,
-  matchSubstr = '/gaizda/',
-  headless = true,           // set false if site requires visible browser
-  extraHeaders = {},         // optional: e.g. { 'Accept-Language': 'en-US,en;q=0.9' }
-  referer = '',              // optional referer for initial navigation
-} = {}) {
-  if (!embedUrl) throw new Error('embedUrl is required');
-  const embedHost = new URL(embedUrl).host;
-
-  const installs = await Launcher.getInstallations();
-  if (!installs.length) throw new Error('No Chrome installation found');
-  const chromePath = installs[0];
+  const installations = await Launcher.getInstallations();
+  if (!installations.length) throw new Error('No Chrome found');
+  const chromePath = installations[0];
 
   const browser = await puppeteer.launch({
     executablePath: chromePath,
-    headless,
-    turnstile: true,
+    headless: false,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
-      '--window-size=1280,720',
+      '--disable-gpu',
+      '--mute-audio',
     ],
-    defaultViewport: { width: 1280, height: 720 },
+    defaultViewport: { width: 1920, height: 1080 },
   });
 
-  const ctx = await browser.createBrowserContext?.() ?? browser.defaultBrowserContext();
-  const page = await ctx.newPage();
+  const page = await browser.newPage();
+  await page.setUserAgent(USER_AGENT);
 
-  await page.setUserAgent(ua);
-  if (extraHeaders && Object.keys(extraHeaders).length) {
-    await page.setExtraHTTPHeaders(extraHeaders);
-  }
-
-  // Optional: block noisy resources (keeps navigation fast)
+  
   await page.setRequestInterception(true);
+
   page.on('request', req => {
-    try {
-      const u = req.url();
-      if (u.startsWith('data:') || u.startsWith('chrome:') || u.startsWith('chrome-extension:')) {
+    const urlStr = req.url();
+    if (urlStr.startsWith('data:') ||
+
+          urlStr.includes('google') ||
+          urlStr.includes('podley') ||
+          urlStr.includes('wsrv.nl') ||
+          urlStr.includes('unwrapsstow')
+        ) {
         return req.abort();
       }
-      const type = req.resourceType();
-      console.log("[REQ]", u, type)
-      if (type === 'image' || type === 'font') return req.abort();
-      return req.continue();
-    } catch {
-      try { req.continue(); } catch {}
-    }
+    req.continue();
   });
 
-  // CDP session for real interception + reading response body
-  const cdp = await page.target().createCDPSession();
-  await cdp.send('Network.enable');
-
-  // Intercept both Request and Response stages for URLs containing /gaizda/
-  await cdp.send('Fetch.enable', {
-    patterns: [
-      {
-        urlPattern: `*${matchSubstr}*`,
-        requestStage: 'Request',
-      },
-      {
-        urlPattern: `*${matchSubstr}*`,
-        requestStage: 'Response',
-      },
-    ],
-  });
-
-  let doneResolve;
-  const done = new Promise(r => { doneResolve = r; });
-
-  // store request info until the response arrives
-  const seen = new Map(); // requestId -> requestInfo
-
-  cdp.on('Fetch.requestPaused', async (evt) => {
-    const { requestId, request, responseStatusCode, responseHeaders } = evt;
-
+  // === Capture POST responses ===
+  page.on('response', async (res) => {
     try {
-      const url = request?.url || '';
-      if (!url.includes(matchSubstr)) {
-        await cdp.send('Fetch.continueRequest', { requestId });
-        return;
+      const url = res.url();
+      const req = res.request();
+      console.log(`[${req.method()}] ${url}`);
+      if (req.method() === 'POST') {
+        const text = await res.text();
+
+        // Look for base64 or m3u8
+        if (text.includes('m3u8')) {
+          console.log('\n✅ POSSIBLE M3U8:\n', text);
+        }
+
+        // Often encrypted responses look like base64
+        if (/^[A-Za-z0-9+/=]+$/.test(text.substring(0, 100))) {
+          console.log('\n📦 Encrypted payload detected:', url);
+        }
       }
 
-      // Stage: Request
-      if (responseStatusCode == null) {
-        seen.set(requestId, {
-          url,
-          method: request.method,
-          headers: request.headers || {},
-          postData: request.postData ?? null,
-        });
+    } catch (e) {}
+  });
 
-        await cdp.send('Fetch.continueRequest', { requestId });
-        return;
+  // === Load page ===
+  await page.goto('https://vidcore.net/tv/224941/1/1', {
+    waitUntil: 'networkidle2'
+  });
+
+  // === Wait for webpack + player init ===
+ await new Promise(resolve => setTimeout(resolve, 30000));
+
+  // ✅ Try extracting directly from player context
+  const m3u8 = await page.evaluate(() => {
+    try {
+      // Common locations
+      if (window?.player?.source?.url) return window.player.source.url;
+      if (window?.hls?.url) return window.hls.url;
+
+      // Scan globals for m3u8
+      for (const key of Object.keys(window)) {
+        try {
+          const val = window[key];
+          if (typeof val === 'string' && val.includes('.m3u8')) {
+            return val;
+          }
+        } catch {}
       }
 
-      // Stage: Response (we can read the body here)
-      const reqInfo = seen.get(requestId) || {
-        url,
-        method: request.method,
-        headers: request.headers || {},
-        postData: request.postData ?? null,
-      };
-
-      let body = null;
-      try {
-        body = await cdp.send('Fetch.getResponseBody', { requestId });
-        // body: { body: string, base64Encoded: boolean }
-      } catch (e) {
-        // Sometimes body isn't available (e.g. streaming); still continue.
-        body = null;
-      }
-
-      const out = {
-        match: matchSubstr,
-        embed: { url: embedUrl, host: embedHost },
-        request: {
-          url: reqInfo.url,
-          method: reqInfo.method,
-          headers: reqInfo.headers,
-          body: reqInfo.postData,
-        },
-        response: {
-          status: responseStatusCode,
-          headers: responseHeaders || [],
-          // Keep raw body for downstream; decode preview for debugging.
-          bodyBase64: body?.base64Encoded ? body.body : Buffer.from(body?.body || '', 'utf8').toString('base64'),
-          base64Encoded: true,
-          previewText: (() => {
-            if (!body) return null;
-            const buf = body.base64Encoded
-              ? Buffer.from(body.body, 'base64')
-              : Buffer.from(body.body, 'utf8');
-            // show a small preview (avoid huge output)
-            return buf.toString('utf8').slice(0, 400);
-          })(),
-        },
-        ts: Date.now(),
-      };
-
-      // Continue request before resolving (avoid deadlocks)
-      await cdp.send('Fetch.continueRequest', { requestId });
-
-      // Resolve only once (first /gaizda/ response)
-      if (doneResolve) {
-        doneResolve(out);
-        doneResolve = null;
-      }
-    } catch (err) {
-      try { await cdp.send('Fetch.continueRequest', { requestId }); } catch {}
-      // Don't crash; just keep waiting
+      return null;
+    } catch (e) {
+      return null;
     }
   });
 
-  // Navigate (this triggers the site’s own JS → makes the /gaizda/ request)
-  await page.goto(embedUrl, {
-    waitUntil: 'domcontentloaded',
-    timeout: timeoutMs,
-    ...(referer ? { referer } : {}),
-  }).catch(() => {});
+  console.log('\n🎯 Extracted m3u8:', m3u8);
 
-  // Wait until we captured the response or timeout
-  const result = await Promise.race([
-    done,
-    (async () => { await sleep(timeoutMs); return null; })(),
-  ]);
+  // === Advanced: hook fetch/XHR BEFORE requests ===
+  // (use if above didn't catch final request)
+  /*
+  await page.evaluate(() => {
+    const origFetch = window.fetch;
 
-  // Cleanup
-  try { await page.close(); } catch {}
-  try { await ctx.close?.(); } catch {}
-  try { await browser.close(); } catch {}
+    window.fetch = async (...args) => {
+      const res = await origFetch(...args);
+      const clone = res.clone();
 
-  if (!result) throw new Error(`Timed out waiting for ${matchSubstr} request`);
-  return result;
-}
+      clone.text().then(t => {
+        if (t.includes('.m3u8')) {
+          console.log("M3U8 FOUND:", t);
+        }
+      });
 
-// CLI usage: node resolve-gaizda.mjs "https://vidfast.pro/..."
-if (process.argv[1] && process.argv[1].endsWith('test3.js') && process.argv[2]) {
-  const embedUrl = process.argv[2];
-  resolveGaizda(embedUrl, {
-    headless: process.platform !== 'linux', // often better non-headless on linux w/ xvfb
-    extraHeaders: { 'Accept-Language': 'en-US,en;q=0.9' },
-    referer: 'https://vidfast.pro/',
-  }).then(r => {
-    console.log(JSON.stringify(r, null, 2));
-  }).catch(e => {
-    console.error(String(e?.message || e));
-    process.exit(1);
+      return res;
+    };
   });
-}
+  */
+
+})();
