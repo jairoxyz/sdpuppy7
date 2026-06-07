@@ -65,9 +65,12 @@ let ALLOWED_HOSTS = new Set([
   'streamed.pk',
   'embedsports.top',
   'embedsporty.top',
+  'embedstreams.top',
+  'embed.st',
   'strmd.top',
   'poocloud.in',
   'pooembed.eu',
+  'embedindia.st',
   'modifiles.fans',
   'vidfast.pro',
   'ppv.to',
@@ -432,7 +435,7 @@ setInterval(() => {
 async function createSession({
   embedUrl, referer, origin, ua, idleMs, m3u8Match,
   collectCount = 1,
-  timeoutMs = 15_000
+  timeoutMs = process.platform === 'linux' ? 60_000 : 45_000
 }) {
   const ctx = await browserMgr.newContext();
   const page = await ctx.newPage();
@@ -450,7 +453,8 @@ async function createSession({
   const embedHost = new URL(embedUrl).host;
 
   await page.setRequestInterception(true);
-  page.on('request', (req) => {
+
+  const requestHandler = async (req) => {
     try {
       const urlStr = req.url();
       
@@ -462,6 +466,7 @@ async function createSession({
           urlStr.includes('google-') ||
           urlStr.includes('wsrv.nl') ||
           urlStr.includes('deuxseethe') ||
+          urlStr.includes('usrpubtrk.com') ||
           urlStr.includes('unwrapsstow')
         ) {
         return req.abort();
@@ -484,7 +489,7 @@ async function createSession({
     } catch {
       try { req.continue(); } catch {}
     }
-  });
+  };
 
   const cache = new Map();
   const waiters = new Map();
@@ -508,19 +513,17 @@ async function createSession({
   let firstResolve;
   const firstPromise = new Promise((r) => (firstResolve = r));
 
-  page.on('response', async (res) => {
+  const responseHandler = async (res) => {
     try {
-      const url = res.url();
 
+      const url = res.url();
       if (url.startsWith('data:') ||
           url.startsWith('chrome:') ||
           url.includes('ads') ||
           url.startsWith('chrome-extension:')) return;
 
       const rq = res.request();
-      //console.log(`[${rq.method()}] ${url} ${res.status()}`);
       log(`[${rq.method()}]`, url, res.status());
-
 
       if (url.toLowerCase().includes('/verify')) log('[RESP TEXT]', await res.text());
 
@@ -575,10 +578,12 @@ async function createSession({
     } catch (e) {
       // swallow
     }
-  });
+  };
+
+  page.on('response', responseHandler);
+  page.on('request', requestHandler);
 
   const sid = newSid();
-
   const session = {
     sid,
     ctx,
@@ -593,7 +598,6 @@ async function createSession({
     cache,
     waiters,
     requestMeta,
-
     async waitForUrl(url, timeoutMsWait = 10000) {
       const existing = cache.get(url);
       if (existing) return existing;
@@ -612,19 +616,33 @@ async function createSession({
       });
     },
     async cleanup() {
-      try { await page.close(); } catch {}
-      if (ctx && ctx.close) {
+      try {
+        // Explicit listener removal
+        page.off('response', responseHandler);
+        page.off('request', requestHandler);
+        
+        // Disable interception before closing
+        await page.setRequestInterception(false).catch(() => {});
+        
+        await page.close();
+      } catch (e) {
+        if (DEFAULT_LOG_ON) errorLog('[SESSION] Page close error:', e?.message);
+      }
+      if (ctx?.close) {
         try { await ctx.close(); } catch {}
       }
     },
   };
+
   SESSIONS.set(sid, session);
 
   const deadline = nowMs() + timeoutMs;
   const timeLeft = () => Math.max(0, deadline - nowMs());
 
+  infoLog('[APP] Reveived request for', embedUrl);
+
   await page.goto(embedUrl, {
-    waitUntil: 'domcontentloaded',
+    waitUntil: 'networkidle2',
     ...(referer ? { referer } : {}),
     timeout: timeLeft(),
   }).catch(() => {});
@@ -644,9 +662,30 @@ async function createSession({
   return { sid, session, firstPlaylist, collectedUrls: collectedUrls.slice(0, collectCount) };
 }
 
-function getSessionOrThrow(sid) {
-  const s = sid && SESSIONS.get(sid);
-  if (!s) throw new Error('Invalid or expired session (sid). Start with ?embed=...');
+// function getSessionOrThrow(sid) {
+//   const s = sid && SESSIONS.get(sid);
+//   if (!s) throw new Error(`Invalid or expired session: ${s}. Start with ?embed=...`);
+
+//   const t = nowMs();
+//   const ageMs = t - (s.createdAt || 0);
+//   const idleMs = t - (s.lastActivityAt || s.createdAt || 0);
+//   const idleLimit = s.idleMs ?? DEFAULT_IDLE_MS;
+
+//   if (ageMs > SESSION_TTL_MS || idleMs > idleLimit) {
+//     try { s.cleanup?.(); } catch {}
+//     SESSIONS.delete(sid);
+//     throw new Error('Session expired (ttl/idle). Start again with ?embed=...');
+//   }
+
+//   return s;
+// }
+
+function validateSession(sid) {
+  const s = SESSIONS.get(sid);
+  if (!s) {
+    // Fake or unknown SID → reject immediately (no cleanup needed)
+    return { session: null, status: 400, message: 'Invalid or fake session (sid). Start with ?embed=...' };
+  }
 
   const t = nowMs();
   const ageMs = t - (s.createdAt || 0);
@@ -654,13 +693,16 @@ function getSessionOrThrow(sid) {
   const idleLimit = s.idleMs ?? DEFAULT_IDLE_MS;
 
   if (ageMs > SESSION_TTL_MS || idleMs > idleLimit) {
+    // Stale/expired SID → clean up immediately
     try { s.cleanup?.(); } catch {}
     SESSIONS.delete(sid);
-    throw new Error('Session expired (ttl/idle). Start again with ?embed=...');
+    // Browser idle check runs every 15s anyway, so no need to await here
+    return { session: null, status: 410, message: 'Session expired (ttl/idle). Start again with ?embed=...' };
   }
 
-  return s;
+  return { session: s };
 }
+
 
 // ------------- Express App -------------
 const app = express();
@@ -673,18 +715,35 @@ app.use((req, res, next) => {
 
 app.get('/health', (_req, res) => res.status(200).send('ok'));
 
+app.get('/health/memory', (req, res) => {
+  const mem = process.memoryUsage();
+  res.json({
+    sessions: SESSIONS.size,
+    browserConnected: !!browserMgr.browser?.connected,
+    memory: {
+      rss: Math.round(mem.rss / 1024 / 1024) + ' MB',
+      heapTotal: Math.round(mem.heapTotal / 1024 / 1024) + ' MB',
+      heapUsed: Math.round(mem.heapUsed / 1024 / 1024) + ' MB',
+    },
+    uptime: process.uptime(),
+  });
+});
+
 app.get('/playlist', async (req, res) => {
   try {
     const embedUrl = req.query.embed?.toString();
     const playlistUrl = req.query.url?.toString();
     const sid = req.query.sid?.toString();
+
+    const isEmbedRequest = !!embedUrl && !sid;
+    const isRefreshRequest = !!sid && !!playlistUrl;
     
-    const toCheck = embedUrl || playlistUrl;
-    if (!toCheck) {
+    if (!isEmbedRequest && !isRefreshRequest) {
       res.status(400).send('Missing query param: embed or url');
       return;
     }
-    const host = new URL(toCheck).host;
+
+    const host = new URL(embedUrl || playlistUrl).host;
     
     if (ALLOWLIST.length && !ALLOWLIST.includes(host)) {
       res.status(403).send('Origin not allowed by proxy');
@@ -695,7 +754,7 @@ app.get('/playlist', async (req, res) => {
     const referer = req.query.referer?.toString() || process.env.UPSTREAM_REFERER || '';
     const origin = req.query.origin?.toString() || process.env.UPSTREAM_ORIGIN || '';
 
-    if (embedUrl && !sid) {
+    if (isEmbedRequest) {
       const resolveOnly = isTruthy(req.query.resolve_only);
       const idleMs = parseIdleMs(req);
       const m3u8Match = req.query.m3u8_match?.toString() || '';
@@ -791,7 +850,9 @@ app.get('/playlist', async (req, res) => {
       return;
     }
 
-    const session = getSessionOrThrow(sid);
+    //const session = getSessionOrThrow(sid);
+    const { session, status, message } = validateSession(sid);
+    if (!session) return res.status(status).send(message);
     session.lastActivityAt = nowMs();
 
     let upstream;
@@ -866,7 +927,9 @@ app.get('/key', async (req, res) => {
       }
     }
 
-    const session = getSessionOrThrow(sid);
+    //const session = getSessionOrThrow(sid);
+    const { session, status, message } = validateSession(sid);
+    if (!session) return res.status(status).send(message);
     session.lastActivityAt = nowMs();
 
     let upstream;
@@ -933,7 +996,7 @@ app.get('/session/close', async (req, res) => {
 
 // ------------- App Init & Lifecycle -------------
 
-// ---------- One-time cache prep ----------
+// ---------- One-time Cloakbrowser cache prep ----------
 let preparedPromise = null;
 function prepareOnce() {
   // Promise-based "once" is concurrency-safe: multiple callers share the same in-flight promise.
@@ -955,15 +1018,7 @@ let globalXvfb = null;
 async function initApp() {
   infoLog('[INIT] Starting up ...')
 
-  // Check / Download CloakBrowser Binary (Runtime only, keeps Docker image small)
-  // const info = binaryInfo();
-  // infoLog(`[INIT] CloakBrowser binary: installed=${info.installed}, version=${info.version || 'unknown'}`);
-  
-  // if (!info.installed) {
-  //   infoLog('[INIT] Binary missing. Downloading now... (this may take 30-60s depending on network)');
-  //   await ensureBinary();
-  //   infoLog('[INIT] ✅ Binary downloaded successfully.');
-  // }
+  // Prepare Cloakbrowser
   await prepareOnce();
 
   // Start Xvfb Synchronously on Linux (Guaranteed before server listens)
@@ -975,6 +1030,7 @@ async function initApp() {
         xvfb_args: ['-screen', '0', '1920x1080x24', '-ac', '-nolisten', 'tcp'],
       });
       globalXvfb.startSync();
+      await new Promise(r => setTimeout(r, 500));
       infoLog('[INIT] Xvfb started on display:', process.env.DISPLAY || ':99');
     } catch (err) {     
       // Option A: Fallback to headless mode if Xvfb fails (keeps server running)
