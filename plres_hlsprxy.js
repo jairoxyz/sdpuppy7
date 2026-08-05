@@ -28,7 +28,7 @@ process.on('uncaughtException', (err) => {
 dns.setDefaultResultOrder('ipv4first');
 
 // --- Logging ---
-const LOG_ENABLED =
+const LOG_ENABLED = 
   (process.env.LOG ?? process.env.DEBUG ?? '').toString().trim().toLowerCase();
 
 const DEFAULT_LOG_ON =
@@ -53,8 +53,8 @@ const PORT = process.env.PROXY_PORT || 3999;
 const DEFAULT_UA =
   process.env.UPSTREAM_UA ||
   (process.platform === 'linux'
-    ? 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.7632.159 Safari/537.36'
-    : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36');
+    ? 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.7922.47 Safari/537.36'
+    : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.7922.47 Safari/537.36');
 
 const ALLOWLIST = (process.env.ALLOWLIST || '')
   .split(',')
@@ -67,6 +67,7 @@ let ALLOWED_HOSTS = new Set([
   'embedsporty.top',
   'embedstreams.top',
   'embed.st',
+  'embedhd.st',
   'strmd.top',
   'poocloud.in',
   'pooembed.eu',
@@ -322,7 +323,7 @@ class BrowserManager {
         this.browser = await (await import('cloakbrowser/puppeteer')).launch({
           headless,
           humanize: true,
-          geoip: true,
+          geoip: false,
           humanPreset: 'careful',  // ✅ Critical for stability
           protocolTimeout: 45_000,
           args: [
@@ -462,10 +463,16 @@ async function createSession({
           urlStr.startsWith('chrome:') ||
           urlStr.startsWith('chrome-extension:') ||
           urlStr.includes('amazonaws.com/cam.edu') ||
-          urlStr.includes('ads') ||
+          urlStr.includes('/ads') ||
           urlStr.includes('google-') ||
           urlStr.includes('wsrv.nl') ||
+          urlStr.includes('pixelsee.app') ||
+          urlStr.includes('openshield') ||
+          urlStr.includes('canatrace') ||
           urlStr.includes('deuxseethe') ||
+          urlStr.includes('appsflyersdk.com') ||
+          urlStr.includes('ndcertainlywhen.com') ||
+          urlStr.includes('pwrgamerz.com') ||
           urlStr.includes('usrpubtrk.com') ||
           urlStr.includes('unwrapsstow')
         ) {
@@ -789,24 +796,23 @@ app.get('/playlist', async (req, res) => {
           let playlistCookies = [];
           try { playlistCookies = await session.page.cookies(u); } catch {}
           const cookieHeader = cookiesToHeader(playlistCookies);
-
           const meta = session.requestMeta?.get(u);
+          const cachedEntry = session.cache?.get(u); // ✅ Fetch cached response to get status
+          
           const realReferer = meta?.referer || session.referer || '';
           const realOrigin  = meta?.origin  || session.origin  || '';
-
           const base = meta?.reqHeaders ? { ...meta.reqHeaders } : {};
-
           const headers = {
             ...base,
           };
-
           delete headers['host'];
           delete headers['Host'];
           delete headers['content-length'];
           delete headers['Content-Length'];
-
+          
           return {
             url: u,
+            status: cachedEntry?.status ?? null, // ✅ Include HTTP status code
             method: meta?.reqMethod || null,
             headers,
             body: meta?.postData ?? null,
@@ -828,11 +834,22 @@ app.get('/playlist', async (req, res) => {
         try { await session.cleanup?.(); } catch {}
         try { SESSIONS.delete(newSid); } catch {}
         await maybeCloseBrowserIfIdle();
-
         res.status(502)
           .set('Cache-Control', 'no-store, must-revalidate')
           .set('Content-Type', 'text/plain; charset=utf-8')
           .send(`Failed to capture first playlist for embed.\n${firstPlaylist?.error || 'empty'}`);
+        return;
+      }
+
+      // ✅ Abort and forward error status if the initial embed playlist failed
+      if (firstPlaylist.status >= 400) {
+        try { await session.cleanup?.(); } catch {}
+        try { SESSIONS.delete(newSid); } catch {}
+        await maybeCloseBrowserIfIdle();
+        res.status(firstPlaylist.status)
+          .set('Cache-Control', 'no-store, must-revalidate')
+          .set('Content-Type', 'text/plain; charset=utf-8')
+          .send(`Upstream embed playlist returned error status: ${firstPlaylist.status}`);
         return;
       }
 
@@ -874,6 +891,19 @@ app.get('/playlist', async (req, res) => {
 
     if (!upstream || !upstream.text) {
       res.status(502).send('Empty upstream playlist');
+      return;
+    }
+
+    // ✅ Stop proxying and forward the exact error status to the client
+    if (upstream.status >= 400) {
+      res.status(upstream.status)
+        .set('Cache-Control', 'no-store, must-revalidate')
+        .send(`Upstream playlist returned error status: ${upstream.status}`);
+      return;
+    }
+
+    if (!upstream.text) {
+      res.status(502).send('Empty upstream playlist text');
       return;
     }
 
@@ -955,6 +985,14 @@ app.get('/key', async (req, res) => {
 
     if (!upstream) {
       res.status(502).send('Empty upstream key response');
+      return;
+    }
+
+    // ✅ Stop proxying and forward the exact error status to the client
+    if (upstream.status >= 400) {
+      res.status(upstream.status)
+        .set('Cache-Control', 'no-store, must-revalidate')
+        .send(`Upstream key returned error status: ${upstream.status}`);
       return;
     }
 
