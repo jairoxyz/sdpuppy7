@@ -5,27 +5,30 @@ import dns from 'node:dns';
 import { URL } from 'node:url';
 import crypto from 'node:crypto';
 
-import puppeteer from 'rebrowser-puppeteer-core';
-import { Launcher } from 'chrome-launcher';
+// ✅ CloakBrowser import (drop-in Puppeteer replacement)
+//import { launch } from 'cloakbrowser/puppeteer';
+import { ensureBinary, clearCache, binaryInfo } from 'cloakbrowser';
+import { ensureAndPruneCloakbrowserCache } from './cloakbrowserCache.js';
+
 
 import Xvfb from 'xvfb';
+import { error } from 'node:console';
+import { userInfo } from 'node:os';
 
 // --- Hardening: keep process alive on unexpected async errors ---
 process.on('unhandledRejection', (reason) => {
   console.error('[UNHANDLED_REJECTION]', reason);
-  // Keep running
 });
 
 process.on('uncaughtException', (err) => {
   console.error('[UNCAUGHT_EXCEPTION]', err);
-  // Keep running (you requested not to stop)
 });
 
 // --- Networking defaults ---
 dns.setDefaultResultOrder('ipv4first');
 
 // --- Logging ---
-const LOG_ENABLED =
+const LOG_ENABLED = 
   (process.env.LOG ?? process.env.DEBUG ?? '').toString().trim().toLowerCase();
 
 const DEFAULT_LOG_ON =
@@ -34,54 +37,53 @@ const DEFAULT_LOG_ON =
 function log(...args) {
   if (DEFAULT_LOG_ON) console.log(...args);
 }
+function infoLog(...args) {
+  console.log(...args);
+}
 function warn(...args) {
   if (DEFAULT_LOG_ON) console.warn(...args);
 }
 function errorLog(...args) {
-  // usually keep errors always on; but you can also gate this if you want
   console.error(...args);
 }
 
 // --- Config ---
 const PORT = process.env.PROXY_PORT || 3999;
 
-// Stable UA; override with ?ua=...
 const DEFAULT_UA =
   process.env.UPSTREAM_UA ||
   (process.platform === 'linux'
-    ? 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.7632.159 Safari/537.36'
-    : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36');
+    ? 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.7922.47 Safari/537.36'
+    : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.7922.47 Safari/537.36');
 
-// Optional allowlist (safety)
 const ALLOWLIST = (process.env.ALLOWLIST || '')
   .split(',')
   .map(s => s.trim())
   .filter(Boolean);
 
-// --- Allowed embed + network hosts (match subdomains too) ---
 let ALLOWED_HOSTS = new Set([
   'streamed.pk',
   'embedsports.top',
   'embedsporty.top',
+  'embedstreams.top',
+  'embed.st',
+  'embedhd.st',
   'strmd.top',
   'poocloud.in',
   'pooembed.eu',
+  'embedindia.st',
   'modifiles.fans',
   'vidfast.pro',
   'ppv.to',
+  'ppv.st',
   'embed.ppv.to',
   '111movies.net',
   'hexa.su',
   'flixer.su',
   'dlstreams.top',
-  'vidsync.xyz',
-  // 'adffdafdsafds.sbs',
-  // 'www.google.com',
-  // 'www.gstatic.com',
+  'vidcore.net',
+  'vidcore.io',
 ]);
-
-// --- allow all hosts for now
-//ALLOWED_HOSTS = new Set([]);
 
 function hostMatchesAllowed(host) {
   if (!ALLOWED_HOSTS || ALLOWED_HOSTS.size === 0) return true;
@@ -98,14 +100,12 @@ function hostMatchesAllowed(host) {
 function isAbsoluteUrl(u = '') { return /^https?:\/\//i.test(u); }
 function toAbsolute(base, rel) { return new URL(rel, base).toString(); }
 
-// truthy parsing for resolve switch
 function isTruthy(v) {
   if (v == null) return false;
   const s = String(v).trim().toLowerCase();
   return s === '1' || s === 'true' || s === 'yes' || s === 'y' || s === 'on';
 }
 
-// format cookies as Cookie request header
 function cookiesToHeader(cookies = []) {
   return cookies
     .filter(c => c?.name && c?.value)
@@ -113,7 +113,6 @@ function cookiesToHeader(cookies = []) {
     .join('; ');
 }
 
-// records count for resolve_only mode (clamped 1..20)
 function parseRecordsCount(req, def = 1) {
   const raw = req.query.records;
   const n = Number(raw);
@@ -137,18 +136,15 @@ function isMasterPlaylist(lines) {
   return lines.some(ln => ln.startsWith('#EXT-X-STREAM-INF') || ln.startsWith('#EXT-X-MEDIA'));
 }
 
-/** Build the canonical sid URLs for a playlist and key uri we want the player to use */
 function buildSidPlaylistUrl(req, absoluteTargetUrl, sid) {
   const params = new URLSearchParams();
   params.set('url', absoluteTargetUrl);
   params.set('sid', sid);
 
-  // Forward useful params that influence upstream behavior (optional)
-  // + forward idle settings through redirect so the player keeps them
   const q = req.query || {};
   const forwardList = [
     'ua', 'referer', 'origin', 'accept', 'accept_language', 'accept_encoding', 'authorization',
-    'idle', 'idle_ms', // per-session idle timeout forwarded through 302
+    'idle', 'idle_ms',
   ];
 
   for (const k of forwardList) {
@@ -168,7 +164,6 @@ function buildSidKeyUrl(req, absoluteKeyUrl, sid) {
   params.set('url', absoluteKeyUrl);
   params.set('sid', sid);
 
-  // Only forward idle controls (optional)
   const q = req.query || {};
   if (q.idle_ms != null && q.idle_ms !== '') params.set('idle_ms', String(q.idle_ms));
   else if (q.idle != null && q.idle !== '') params.set('idle', String(q.idle));
@@ -176,9 +171,6 @@ function buildSidKeyUrl(req, absoluteKeyUrl, sid) {
   return `${req.protocol}://${req.get('host')}/key?${params.toString()}`;
 }
 
-/** Rewrite MASTER playlists to point variant/media playlists back to this proxy with the same sid.
- *  TS segments are NOT rewritten.
- */
 function rewriteMasterPlaylist(lines, baseUrl, req, sid) {
   const out = [];
   for (let i = 0; i < lines.length; i++) {
@@ -213,7 +205,6 @@ function rewriteMasterPlaylist(lines, baseUrl, req, sid) {
   return out;
 }
 
-/* Rewrite #EXT-X-KEY to proxy */
 function rewriteExtXKeyUriToProxy(line, baseUrl, req, sid) {
   if (!line.startsWith('#EXT-X-KEY')) return line;
 
@@ -222,7 +213,6 @@ function rewriteExtXKeyUriToProxy(line, baseUrl, req, sid) {
   const raw = (m[2] || m[3] || '').trim();
   if (!raw) return line;
 
-  // Make absolute against playlist base URL
   const abs = isAbsoluteUrl(raw) ? raw : toAbsolute(baseUrl, raw);
   if (!/^https?:\/\//i.test(abs)) return line;
 
@@ -230,7 +220,7 @@ function rewriteExtXKeyUriToProxy(line, baseUrl, req, sid) {
   return line.replace(/URI=("([^"]+)"|([^,]+))/i, `URI="${proxied}"`);
 }
 
-// ------------- Session Store (single page per sid) -------------
+// ------------- Session Store -------------
 const SESSIONS = new Map();  // sid -> session
 
 // Session and browser cleanup
@@ -247,12 +237,6 @@ function clamp(n, min, max) {
   return Math.max(min, Math.min(max, n));
 }
 
-/**
- * Parse per-session idle timeout from request query:
- * - idle_ms=<milliseconds> has priority
- * - idle=<seconds> is also supported
- * - returns DEFAULT_IDLE_MS if not provided or invalid
- */
 function parseIdleMs(req) {
   const q = req.query || {};
 
@@ -272,112 +256,157 @@ function parseIdleMs(req) {
 function nowMs() { return Date.now(); }
 function newSid() { return crypto.randomUUID(); }
 
-// ------------- Browser Manager -------------
+// ------------- Browser Manager (CloakBrowser) -------------
+// ------------- Browser Manager (SINGLE BROWSER ONLY) -------------
 class BrowserManager {
   constructor() {
     this.browser = null;
-    this.chromePath = null;
     this.xvfbsession = null;
-
+    this._launchPromise = null;
   }
 
-  startXvfbIfNeeded() {
-    // You want non-headless on Linux, so Xvfb should start on Linux.
-    if (process.platform !== 'linux') return;
-    if (this.xvfbsession) return;
+  // SAFE FALLBACK: Only starts Xvfb if not already running
+  ensureXvfb() {
+  if (process.platform !== 'linux') return;
+  if (this.xvfbsession) return;
 
-    try {
-      this.xvfbsession = new Xvfb({
-        silent: true,
-        xvfb_args: ['-screen', '0', '1920x1080x24', '-ac'],
-      });
-      this.xvfbsession.startSync();
-      log('[XVFB] Started');
-    } catch (err) {
-      console.error('Xvfb start error:', err?.message || err);
-      this.xvfbsession = null;
+  // If globalXvfb exists or DISPLAY is set, assume Xvfb is already running
+  if (globalXvfb || process.env.DISPLAY) {
+    log('[XVFB] Using existing display.');
+    return;
+  }
+
+  try {
+    this.xvfbsession = new Xvfb({
+      silent: true,
+      xvfb_args: ['-screen', '0', '1920x1080x24', '-ac', '-nolisten', 'tcp'],
+    });
+    this.xvfbsession.startSync();
+    infoLog('[BROWSER] Xvfb started on display:', process.env.DISPLAY || ':99');
+  } catch (err) {
+    if (err.message.includes('already in use') || err.message.includes('locked')) {
+      infoLog('[XVFB] Display already running, skipping fallback.');
+    } else {
+      errorLog('[BROWSER] ⚠️ Xvfb failed to start:', err.message);
+      // Don't throw — let CloakBrowser attempt headless as last resort
     }
+    this.xvfbsession = null;
   }
+}
 
   stopXvfb() {
     if (!this.xvfbsession) return;
-    try {
-      this.xvfbsession.stopSync();
-      log('[XVFB] Stopped');
-    } catch (err) {
-      console.error('Failed to stop Xvfb:', err);
-    } finally {
-      this.xvfbsession = null;
-    }
+    try { this.xvfbsession.stopSync(); console.log('[XVFB] Stopped.'); } 
+    catch (err) { console.warn('[XVFB] Stop failed:', err.message); }
+    finally { this.xvfbsession = null; }
   }
 
   async ensureBrowser() {
-    if (this.browser) return this.browser;
-    const installs = await Launcher.getInstallations();
-    if (!installs.length) throw new Error('No Chrome found');
-    this.chromePath = installs[0];
+    // Reuse existing healthy browser
+    if (this.browser?.connected && this.browser?.process?.()?.exitCode === null) {
+      return this.browser;
+    }
 
-    const headless = process.platform === 'linux' ? false : true;
-    if (!headless) this.startXvfbIfNeeded();
+    // Coalesce parallel launches
+    if (this._launchPromise) return this._launchPromise;
 
-    this.browser = await puppeteer.launch({
-      executablePath: this.chromePath,
-      headless: headless,
-      turnstile: true,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '-window-size=1280,720',
-        // '--disable-dev-shm-usage', // optional for Docker
-        //'--disable-gpu',
-        //'--mute-audio',
-        //'--disable-web-security',
-        //'--disable-features=Translate,OptimizationHints,MediaRouter,DialMediaRouteProvider,CalculateNativeWinOcclusion,InterestFeedContentSuggestions,CertificateTransparencyComponentUpdater,AutofillServerCommunication,PrivacySandboxSettings4,AutomationControlled',
-        // WebRTC hard-disable
-        //'--disable-webrtc',
-        //'--disable-features=WebRtcHideLocalIpsWithMdns', /* disabled with above */
-        //'--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
-      ],
-      defaultViewport: { width: 1280, height: 720 },
-    });
+    this._launchPromise = (async () => {
+      try {
+        // Clean up any zombie browser first
+        if (this.browser) {
+          try { await this.browser.close(); } catch {}
+          this.browser = null;
+        }
 
-    // Stop Xvfb when browser disconnects
-    this.browser.on('disconnected', () => {
-      try { this.stopXvfb(); } catch {}
-    });
+        const headless = process.platform === 'linux' ? false : true;
+        if (!headless) this.ensureXvfb();
 
-    return this.browser;
+        // Launch with working-script settings
+        this.browser = await (await import('cloakbrowser/puppeteer')).launch({
+          headless,
+          humanize: true,
+          geoip: false,
+          humanPreset: 'careful',  // ✅ Critical for stability
+          protocolTimeout: 45_000,
+          args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-gpu',
+            '-window-size=1280,720',
+            '--fingerprint=12345',  // ✅ Fixed fingerprint prevents conflicts
+          ],
+          defaultViewport: { width: 1280, height: 720 },
+        });
+
+        // Stop Xvfb AND null the browser ref so the next request relaunches.
+        this.browser.on('disconnected', () => {
+          console.warn('[BROWSER] Disconnected — will relaunch on next request');
+          this.browser = null;
+          try { this.stopXvfb(); } catch {}
+        });
+
+        return this.browser;
+      } finally {
+        this._launchPromise = null;
+      }
+    })();
+
+    return this._launchPromise;
   }
 
   async newContext() {
-    const browser = await this.ensureBrowser();
-    if (typeof browser.createIncognitoBrowserContext === 'function') {
-      return await browser.createIncognitoBrowserContext();
+    const tryIt = async () => {
+      const browser = await this.ensureBrowser();
+      if (typeof browser.createIncognitoBrowserContext === 'function') {
+        return await browser.createIncognitoBrowserContext();
+      }
+      if (typeof browser.createBrowserContext === 'function') {
+        return await browser.createBrowserContext();
+      }
+      return typeof browser.defaultBrowserContext === 'function'
+        ? browser.defaultBrowserContext()
+        : (browser.defaultBrowserContext || null);
+    };
+
+    try {
+      return await tryIt();
+    } catch (err) {
+      const msg = String(err?.message || err || '');
+      const recoverable =
+        err?.name === 'ProtocolError' ||
+        /timed out|Target closed|Connection closed|Protocol error/i.test(msg);
+      if (!recoverable) throw err;
+
+      console.warn('[BROWSER] newContext failed, force-closing + retrying once:', msg);
+      await this.forceClose();
+      return await tryIt();
     }
-    if (typeof browser.createBrowserContext === 'function') {
-      return await browser.createBrowserContext();
-    }
-    return typeof browser.defaultBrowserContext === 'function'
-      ? browser.defaultBrowserContext()
-      : (browser.defaultBrowserContext || null);
   }
-  
-  async closeBrowser() {
-    if (!this.browser) {
-      // Still stop Xvfb if somehow running without browser
-      this.stopXvfb();
-      return;
-    }
-    try { await this.browser.close(); } catch {}
+
+  async forceClose() {
+    if (!this.browser) { this.stopXvfb(); return; }
+    try {
+      await Promise.race([
+        this.browser.close(),
+        new Promise(r => setTimeout(r, 3000)),
+      ]);
+    } catch {}
     this.browser = null;
-    this.chromePath = null;
     this.stopXvfb();
   }
 
+  async closeBrowser() {
+    if (this.browser) {
+      try { await this.browser.close(); } catch {}
+      this.browser = null;
+    }
+    this.stopXvfb();
+  }
 }
+
 const browserMgr = new BrowserManager();
 
-// Close browser when no sessions remain (optional but recommended)
 async function maybeCloseBrowserIfIdle() {
   if (SESSIONS.size === 0 && browserMgr.browser) {
     await browserMgr.closeBrowser();
@@ -385,14 +414,13 @@ async function maybeCloseBrowserIfIdle() {
   }
 }
 
-
-// prune by TTL OR idle; run frequently so idle is accurate
 async function pruneSessions() {
   const t = nowMs();
+  
   for (const [sid, s] of SESSIONS.entries()) {
     const ageMs = t - (s.createdAt || 0);
     const idleMs = t - (s.lastActivityAt || s.createdAt || 0);
-    const idleLimit = s.idleMs ?? DEFAULT_IDLE_MS; // per-session idle
+    const idleLimit = s.idleMs ?? DEFAULT_IDLE_MS;
 
     if (ageMs > SESSION_TTL_MS || idleMs > idleLimit) {
       try { await s.cleanup?.(); } catch {}
@@ -405,56 +433,50 @@ async function pruneSessions() {
 
 setInterval(() => {
   pruneSessions().catch(() => {});
-}, 10_000).unref(); // every 10s
+}, 15_000).unref();
 
 async function createSession({
   embedUrl, referer, origin, ua, idleMs, m3u8Match,
-  collectCount = 1, // number of matching URLs to collect for resolve_only
-  timeoutMs = 15000
+  collectCount = 1,
+  timeoutMs = process.platform === 'linux' ? 60_000 : 45_000
 }) {
   const ctx = await browserMgr.newContext();
   const page = await ctx.newPage();
 
-  // --- Hardening: capture page-level errors (do not crash process) ---
   page.on('error', (e) => console.error('[PAGE_ERROR]', e));
   page.on('pageerror', (e) => console.error('[PAGE_PAGEERROR]', e));
 
   await page.setUserAgent(ua || DEFAULT_UA);
   await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
 
-  // optional substring; when present it becomes the ONLY match condition
   const matchSub = (m3u8Match != null && String(m3u8Match).trim() !== '')
     ? String(m3u8Match)
     : '';
 
-  // always allow embed url host
   const embedHost = new URL(embedUrl).host;
 
-  // Only block base64 images and off-domain navigations
   await page.setRequestInterception(true);
-  page.on('request', (req) => {
-    try {
 
+  const requestHandler = async (req) => {
+    try {
       const urlStr = req.url();
       
-      // debug log for key uri proxying
-      // if (urlStr.toLowerCase().includes('/key')) {        
-      //   log('[KEY REQ]', {
-      //           method: req.method(),
-      //           url: urlStr,
-      //           headers: req.headers(),
-      //           resourceType: req.resourceType(),
-      //           frameUrl: req.frame()?.url?.() || null,
-      //         });
-      // }
-
-      // Block inline base64 images, chrome and spam urls (safe for HLS)
       if (urlStr.startsWith('data:') ||
           urlStr.startsWith('chrome:') ||
           urlStr.startsWith('chrome-extension:') ||
           urlStr.includes('amazonaws.com/cam.edu') ||
-          urlStr.includes('ads') ||
-          urlStr.includes('wsrv.nl')
+          urlStr.includes('/ads') ||
+          urlStr.includes('google-') ||
+          urlStr.includes('wsrv.nl') ||
+          urlStr.includes('pixelsee.app') ||
+          urlStr.includes('openshield') ||
+          urlStr.includes('canatrace') ||
+          urlStr.includes('deuxseethe') ||
+          urlStr.includes('appsflyersdk.com') ||
+          urlStr.includes('ndcertainlywhen.com') ||
+          urlStr.includes('pwrgamerz.com') ||
+          urlStr.includes('usrpubtrk.com') ||
+          urlStr.includes('unwrapsstow')
         ) {
         return req.abort();
       }
@@ -466,12 +488,9 @@ async function createSession({
       const isDoc = type === 'document' || req.isNavigationRequest();
       const frame = req.frame();
       const isMainFrame = frame === page.mainFrame();
-      const isNav = isDoc && isMainFrame;   // true only for top-level doc navigations
-      //log('[REQ] ', urlStr, type, isNav)
+      const isNav = isDoc && isMainFrame;
 
-      // Only block top-level navigations to non-allowlisted hosts
       if (isNav && !hostMatchesAllowed(host) && host !== embedHost && !host.endsWith('.' + embedHost)) {
-        //log('!!!BLOCKED!!!')
         return req.abort();
       }
 
@@ -479,16 +498,11 @@ async function createSession({
     } catch {
       try { req.continue(); } catch {}
     }
-  });
+  };
 
-  // Passive playlist capture (no fetch/CDP)
-  const cache = new Map();   // url -> { text, status, headers, ts }
-  const waiters = new Map(); // url -> Set(resolveFn)
-
-  // store actual request headers for each playlist URL (referer/origin etc.)
-  const requestMeta = new Map(); // url -> { reqHeaders, referer, origin, frameUrl, ts }
-
-  // Collect up to collectCount matching URLs (deduped), in the order seen
+  const cache = new Map();
+  const waiters = new Map();
+  const requestMeta = new Map();
   const collectedUrls = [];
   const seenUrls = new Set();
   let collectedResolve;
@@ -505,37 +519,25 @@ async function createSession({
     }
   }
 
-  // Promise to get first playlist quickly
   let firstResolve;
   const firstPromise = new Promise((r) => (firstResolve = r));
 
-  // Single response handler: detect m3u8, capture body once, capture real request headers
-  page.on('response', async (res) => {
+  const responseHandler = async (res) => {
     try {
-      const url = res.url();
 
-      // ignore data:* and chrome*
+      const url = res.url();
       if (url.startsWith('data:') ||
           url.startsWith('chrome:') ||
           url.includes('ads') ||
           url.startsWith('chrome-extension:')) return;
 
-      log('[RESP]', url, res.status());
+      const rq = res.request();
+      log(`[${rq.method()}]`, url, res.status());
 
-      // dlhd grecaptcha verify response
       if (url.toLowerCase().includes('/verify')) log('[RESP TEXT]', await res.text());
-
-      // log debug for key uri proxy response
-      // if (url.toLowerCase().includes('/key')) {
-      //   const buf = await res.buffer();
-      //   log('[RESP KEY]', buf.toString('hex'));
-      //   log('[RESP KEY HEADERS]', res.request().headers());
-      // }
 
       const ct = (res.headers()['content-type'] || '').toLowerCase();
 
-      // If matchSub is present => ONLY accept URLs that include it.
-      // Else => fallback to standard m3u8 detection.
       const isM3U8 = matchSub
         ? url.includes(matchSub)
         : (
@@ -546,10 +548,8 @@ async function createSession({
 
       if (!isM3U8) return;
 
-      // collect candidate URL(s) for resolve_only records mode
       collectUrl(url);
 
-      // Capture *actual request headers* Chromium used for this playlist request
       const req = res.request?.();      
       const reqMethod = req?.method?.() || 'UNKNOWN';
       const reqHeaders = req?.headers?.() || {};
@@ -570,46 +570,43 @@ async function createSession({
         ts: nowMs(),
       });
 
-      // Read body once
       const text = await res.text();
-      //if (url.toLowerCase().includes('/gaizda/')) log('[RESP TEXT]', await res.text());
       const entry = { text, status: res.status(), headers: res.headers(), ts: nowMs() };
       cache.set(url, entry);
 
-      // Resolve first playlist once
       if (firstResolve) {
         firstResolve({ url, ...entry });
         firstResolve = null;
       }
 
-      // Wake waiters
       const set = waiters.get(url);
       if (set && set.size) {
         for (const resolve of set) resolve(entry);
         waiters.delete(url);
       }
     } catch (e) {
-      // swallow to avoid unhandled rejections from event handler
-      //if (DEFAULT_LOG_ON) console.error('[RESP_HANDLER_ERROR]', e);
+      // swallow
     }
-  });
+  };
+
+  page.on('response', responseHandler);
+  page.on('request', requestHandler);
 
   const sid = newSid();
   const session = {
     sid,
     ctx,
-    page,       // embed page (never navigate away)
+    page,
     embedUrl,
     referer,
-    origin, // store origin for resolve headers output
+    origin,
     ua: ua || DEFAULT_UA,
     createdAt: nowMs(),
-    lastActivityAt: nowMs(), // activity timestamp
-    idleMs: idleMs || DEFAULT_IDLE_MS, // per-session idle timeout
+    lastActivityAt: nowMs(),
+    idleMs: idleMs || DEFAULT_IDLE_MS,
     cache,
     waiters,
-    requestMeta, //request headers etc.
-
+    requestMeta,
     async waitForUrl(url, timeoutMsWait = 10000) {
       const existing = cache.get(url);
       if (existing) return existing;
@@ -628,31 +625,42 @@ async function createSession({
       });
     },
     async cleanup() {
-      try { await page.close(); } catch {}
-      if (ctx && ctx.close) {
+      try {
+        // Explicit listener removal
+        page.off('response', responseHandler);
+        page.off('request', requestHandler);
+        
+        // Disable interception before closing
+        await page.setRequestInterception(false).catch(() => {});
+        
+        await page.close();
+      } catch (e) {
+        if (DEFAULT_LOG_ON) errorLog('[SESSION] Page close error:', e?.message);
+      }
+      if (ctx?.close) {
         try { await ctx.close(); } catch {}
       }
     },
   };
+
   SESSIONS.set(sid, session);
 
   const deadline = nowMs() + timeoutMs;
   const timeLeft = () => Math.max(0, deadline - nowMs());
 
-  // Go to the EMBED page (with referer) and wait for first playlist capture
+  infoLog('[APP] Reveived request for', embedUrl);
+
   await page.goto(embedUrl, {
-    waitUntil: 'domcontentloaded',
+    waitUntil: 'networkidle2',
     ...(referer ? { referer } : {}),
     timeout: timeLeft(),
   }).catch(() => {});
 
-  // Wait a bounded time for first playlist
   const firstPlaylist = await Promise.race([
     firstPromise,
     new Promise((r) => setTimeout(() => r(null), timeLeft())),
   ]);
 
-  // If collectCount > 1, wait (within the same deadline) for enough URLs or timeout
   if (collectCount > 1) {
     await Promise.race([
       collectedPromise,
@@ -663,24 +671,47 @@ async function createSession({
   return { sid, session, firstPlaylist, collectedUrls: collectedUrls.slice(0, collectCount) };
 }
 
-function getSessionOrThrow(sid) {
-  const s = sid && SESSIONS.get(sid);
-  if (!s) throw new Error('Invalid or expired session (sid). Start with ?embed=...');
+// function getSessionOrThrow(sid) {
+//   const s = sid && SESSIONS.get(sid);
+//   if (!s) throw new Error(`Invalid or expired session: ${s}. Start with ?embed=...`);
+
+//   const t = nowMs();
+//   const ageMs = t - (s.createdAt || 0);
+//   const idleMs = t - (s.lastActivityAt || s.createdAt || 0);
+//   const idleLimit = s.idleMs ?? DEFAULT_IDLE_MS;
+
+//   if (ageMs > SESSION_TTL_MS || idleMs > idleLimit) {
+//     try { s.cleanup?.(); } catch {}
+//     SESSIONS.delete(sid);
+//     throw new Error('Session expired (ttl/idle). Start again with ?embed=...');
+//   }
+
+//   return s;
+// }
+
+function validateSession(sid) {
+  const s = SESSIONS.get(sid);
+  if (!s) {
+    // Fake or unknown SID → reject immediately (no cleanup needed)
+    return { session: null, status: 400, message: 'Invalid or fake session (sid). Start with ?embed=...' };
+  }
 
   const t = nowMs();
   const ageMs = t - (s.createdAt || 0);
   const idleMs = t - (s.lastActivityAt || s.createdAt || 0);
-  const idleLimit = s.idleMs ?? DEFAULT_IDLE_MS; // per-session idle
+  const idleLimit = s.idleMs ?? DEFAULT_IDLE_MS;
 
-  // enforce TTL + idle immediately (not only in background prune)
   if (ageMs > SESSION_TTL_MS || idleMs > idleLimit) {
+    // Stale/expired SID → clean up immediately
     try { s.cleanup?.(); } catch {}
     SESSIONS.delete(sid);
-    throw new Error('Session expired (ttl/idle). Start again with ?embed=...');
+    // Browser idle check runs every 15s anyway, so no need to await here
+    return { session: null, status: 410, message: 'Session expired (ttl/idle). Start again with ?embed=...' };
   }
 
-  return s;
+  return { session: s };
 }
+
 
 // ------------- Express App -------------
 const app = express();
@@ -693,21 +724,35 @@ app.use((req, res, next) => {
 
 app.get('/health', (_req, res) => res.status(200).send('ok'));
 
+app.get('/health/memory', (req, res) => {
+  const mem = process.memoryUsage();
+  res.json({
+    sessions: SESSIONS.size,
+    browserConnected: !!browserMgr.browser?.connected,
+    memory: {
+      rss: Math.round(mem.rss / 1024 / 1024) + ' MB',
+      heapTotal: Math.round(mem.heapTotal / 1024 / 1024) + ' MB',
+      heapUsed: Math.round(mem.heapUsed / 1024 / 1024) + ' MB',
+    },
+    uptime: process.uptime(),
+  });
+});
+
 app.get('/playlist', async (req, res) => {
   try {
     const embedUrl = req.query.embed?.toString();
     const playlistUrl = req.query.url?.toString();
     const sid = req.query.sid?.toString();
-    
-    // if (playlistUrl) log('[PLAYLIST HIT]', sid, playlistUrl);
 
-    // allowlist
-    const toCheck = embedUrl || playlistUrl;
-    if (!toCheck) {
+    const isEmbedRequest = !!embedUrl && !sid;
+    const isRefreshRequest = !!sid && !!playlistUrl;
+    
+    if (!isEmbedRequest && !isRefreshRequest) {
       res.status(400).send('Missing query param: embed or url');
       return;
     }
-    const host = new URL(toCheck).host;
+
+    const host = new URL(embedUrl || playlistUrl).host;
     
     if (ALLOWLIST.length && !ALLOWLIST.includes(host)) {
       res.status(403).send('Origin not allowed by proxy');
@@ -718,17 +763,10 @@ app.get('/playlist', async (req, res) => {
     const referer = req.query.referer?.toString() || process.env.UPSTREAM_REFERER || '';
     const origin = req.query.origin?.toString() || process.env.UPSTREAM_ORIGIN || '';
 
-    // ---- Warm-up from embed: respond with 302 to sid URL (or resolve-only JSON) ----
-    if (embedUrl && !sid) {
-      const resolveOnly =
-        // isTruthy(req.query.resolve) ||
-        isTruthy(req.query.resolve_only);
-      // || isTruthy(req.query.url_only);
-
-      const idleMs = parseIdleMs(req); // per-session idle config
+    if (isEmbedRequest) {
+      const resolveOnly = isTruthy(req.query.resolve_only);
+      const idleMs = parseIdleMs(req);
       const m3u8Match = req.query.m3u8_match?.toString() || '';
-
-      // how many records to return in resolve_only mode (clamped 1..20)
       const recordsCount = resolveOnly ? parseRecordsCount(req, 1) : 1;
 
       const { sid: newSid, session, firstPlaylist, collectedUrls } = await createSession({
@@ -736,18 +774,15 @@ app.get('/playlist', async (req, res) => {
         idleMs,
         m3u8Match,
         collectCount: recordsCount,
-        timeoutMs: 15000,
+        timeoutMs: 45_000,
       });
 
-      // resolve-only mode: ALWAYS return records array
       if (resolveOnly) {
-        // Prefer collected URLs; if none, fall back to firstPlaylist if available
         const urls = (collectedUrls && collectedUrls.length)
           ? collectedUrls
           : (firstPlaylist?.url ? [firstPlaylist.url] : []);
 
         if (!urls.length) {
-          // cleanup on failure
           try { await session.cleanup?.(); } catch {}
           try { SESSIONS.delete(newSid); } catch {}
           await maybeCloseBrowserIfIdle();
@@ -759,36 +794,27 @@ app.get('/playlist', async (req, res) => {
           return;
         }
 
-        // Build records with per-URL cookie headers + actual referer/origin from Chromium request
         const records = await Promise.all(urls.slice(0, recordsCount).map(async (u) => {
           let playlistCookies = [];
           try { playlistCookies = await session.page.cookies(u); } catch {}
           const cookieHeader = cookiesToHeader(playlistCookies);
-
           const meta = session.requestMeta?.get(u);
+          const cachedEntry = session.cache?.get(u); // ✅ Fetch cached response to get status
+          
           const realReferer = meta?.referer || session.referer || '';
           const realOrigin  = meta?.origin  || session.origin  || '';
-
-          // Start from Chromium's actual request header set,
           const base = meta?.reqHeaders ? { ...meta.reqHeaders } : {};
-
           const headers = {
             ...base,
-            // normalize/override if needed
-            // 'User-Agent': session.ua,
-            // ...(realReferer ? { 'Referer': realReferer } : {}),
-            // ...(realOrigin  ? { 'Origin':  realOrigin  } : {}),
-            // ...(cookieHeader ? { 'Cookie': cookieHeader } : {}),
           };
-
-          // Avoid forwarding problematic hop-by-hop/derived headers
           delete headers['host'];
           delete headers['Host'];
           delete headers['content-length'];
           delete headers['Content-Length'];
-
+          
           return {
             url: u,
+            status: cachedEntry?.status ?? null, // ✅ Include HTTP status code
             method: meta?.reqMethod || null,
             headers,
             body: meta?.postData ?? null,
@@ -796,7 +822,6 @@ app.get('/playlist', async (req, res) => {
           };
         }));
 
-        // close session + browser (if no sessions remain)
         try { await session.cleanup?.(); } catch {}
         SESSIONS.delete(newSid);
         await maybeCloseBrowserIfIdle();
@@ -807,17 +832,26 @@ app.get('/playlist', async (req, res) => {
         return;
       }
 
-      // Redirect mode requires a first playlist URL
       if (!firstPlaylist?.url) {
-        // cleanup session on firstPlaylist failure to avoid leaks
         try { await session.cleanup?.(); } catch {}
         try { SESSIONS.delete(newSid); } catch {}
         await maybeCloseBrowserIfIdle();
-
         res.status(502)
           .set('Cache-Control', 'no-store, must-revalidate')
           .set('Content-Type', 'text/plain; charset=utf-8')
           .send(`Failed to capture first playlist for embed.\n${firstPlaylist?.error || 'empty'}`);
+        return;
+      }
+
+      // ✅ Abort and forward error status if the initial embed playlist failed
+      if (firstPlaylist.status >= 400) {
+        try { await session.cleanup?.(); } catch {}
+        try { SESSIONS.delete(newSid); } catch {}
+        await maybeCloseBrowserIfIdle();
+        res.status(firstPlaylist.status)
+          .set('Cache-Control', 'no-store, must-revalidate')
+          .set('Content-Type', 'text/plain; charset=utf-8')
+          .send(`Upstream embed playlist returned error status: ${firstPlaylist.status}`);
         return;
       }
 
@@ -830,18 +864,16 @@ app.get('/playlist', async (req, res) => {
       return;
     }
 
-    // ---- Reloads on the same session: serve fresh upstream playlist ----
     if (!sid || !playlistUrl) {
       res.status(400).send('Missing query param: sid and url');
       return;
     }
 
-    const session = getSessionOrThrow(sid);
-
-    // activity mark (this is what the idle timeout is based on)
+    //const session = getSessionOrThrow(sid);
+    const { session, status, message } = validateSession(sid);
+    if (!session) return res.status(status).send(message);
     session.lastActivityAt = nowMs();
 
-    // Make the headless browser fetch the playlist directly
     let upstream;
     try {
       upstream = await session.page.evaluate(async (u) => {
@@ -864,22 +896,31 @@ app.get('/playlist', async (req, res) => {
       return;
     }
 
-    // Process the playlist exactly like before
+    // ✅ Stop proxying and forward the exact error status to the client
+    if (upstream.status >= 400) {
+      res.status(upstream.status)
+        .set('Cache-Control', 'no-store, must-revalidate')
+        .send(`Upstream playlist returned error status: ${upstream.status}`);
+      return;
+    }
+
+    if (!upstream.text) {
+      res.status(502).send('Empty upstream playlist text');
+      return;
+    }
+
     const baseUrl = playlistUrl;
     const lines = upstream.text.split(/\r?\n/);
 
     let processed = lines;
     if (isMasterPlaylist(lines)) {
       processed = rewriteMasterPlaylist(lines, baseUrl, req, sid);
-      // res.set('X-Notice', 'Master playlist rewritten');
     }
 
     const out = processed.map((line) => {
       if (!line || line.startsWith('#')) {
         if (line.startsWith('#EXT-X-KEY')) {
-          // proxy aes key requests
           return rewriteExtXKeyUriToProxy(line, baseUrl, req, sid);
-          //return absolutizeKeyOrMapUri(line, baseUrl);
         }
         if (line.startsWith('#EXT-X-MAP')) {
           return absolutizeKeyOrMapUri(line, baseUrl);
@@ -902,18 +943,14 @@ app.get('/playlist', async (req, res) => {
 
 app.get('/key', async (req, res) => {
   try {
-    
     const sid = req.query.sid?.toString();
     const keyUrl = req.query.url?.toString();
     
-    //log('[KEY HIT]', sid, keyUrl);
-
     if (!sid || !keyUrl) {
       res.status(400).send('Missing query param: sid and url');
       return;
     }
 
-    // Optional allowlist (recommended)
     if (ALLOWLIST.length) {
       const host = new URL(keyUrl).host;
       if (!ALLOWLIST.includes(host)) {
@@ -922,18 +959,17 @@ app.get('/key', async (req, res) => {
       }
     }
 
-    const session = getSessionOrThrow(sid);
+    //const session = getSessionOrThrow(sid);
+    const { session, status, message } = validateSession(sid);
+    if (!session) return res.status(status).send(message);
     session.lastActivityAt = nowMs();
 
-    // Fetch inside the embed page context, letting Chromium set Referer/Origin naturally
     let upstream;
     try {
       upstream = await session.page.evaluate(async (u) => {
         const r = await fetch(u, {
           cache: 'no-store',
-          //credentials: 'include', // send cookies for key host if present
           mode: 'cors',
-
         });
 
         const buf = await r.arrayBuffer();
@@ -951,6 +987,14 @@ app.get('/key', async (req, res) => {
 
     if (!upstream) {
       res.status(502).send('Empty upstream key response');
+      return;
+    }
+
+    // ✅ Stop proxying and forward the exact error status to the client
+    if (upstream.status >= 400) {
+      res.status(upstream.status)
+        .set('Cache-Control', 'no-store, must-revalidate')
+        .send(`Upstream key returned error status: ${upstream.status}`);
       return;
     }
 
@@ -972,7 +1016,6 @@ app.get('/key', async (req, res) => {
   }
 });
 
-// Optional: explicit session close
 app.get('/session/close', async (req, res) => {
   try {
     const sid = req.query.sid?.toString();
@@ -991,81 +1034,97 @@ app.get('/session/close', async (req, res) => {
   }
 });
 
-// Start server
-const server = http.createServer(app);
+// ------------- App Init & Lifecycle -------------
 
-// --- Hardening: keep server alive on low-level HTTP errors ---
-server.on('error', (err) => {
-  console.error('[SERVER_ERROR]', err);
-});
-
-server.on('clientError', (err, socket) => {
-  console.error('[CLIENT_ERROR]', err?.message || err);
-  try {
-    socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
-  } catch {}
-});
-
-server.listen(PORT, () => {
-  console.log(`Headless HLS playlist resolver and proxy on ${PORT}`);
-});
-
-
-// --- Shutdown and stop Xvfb on shutdown signals
-
-let shuttingDown = false;
-
-async function gracefulShutdown(signal = 'SIGINT') {
-  if (shuttingDown) return;
-  shuttingDown = true;
-
-  console.log(`[SHUTDOWN] Received ${signal}, shutting down...`);
-
-  // 1) Stop accepting new connections
-  try {
-    await new Promise((resolve) => server.close(() => resolve()));
-    console.log('[SHUTDOWN] HTTP server closed');
-  } catch (e) {
-    console.error('[SHUTDOWN] server.close error:', e);
+// ---------- One-time Cloakbrowser cache prep ----------
+let preparedPromise = null;
+function prepareOnce() {
+  // Promise-based "once" is concurrency-safe: multiple callers share the same in-flight promise.
+  if (!preparedPromise) {
+    preparedPromise = (async () => {
+      try {
+        await ensureAndPruneCloakbrowserCache({ syncUpdateAtStartup: true });
+        console.log('[INIT] Cloakbrowser cache prepared');
+      } catch (e) {
+        console.warn('[INIT] Cloakbrowser cache prune skipped:', e?.message || e);
+      }
+    })();
   }
-
-  // 2) Cleanup all sessions (pages/contexts)
-  try {
-    const sessions = Array.from(SESSIONS.values());
-    await Promise.allSettled(sessions.map(s => s.cleanup?.()));
-    SESSIONS.clear();
-    console.log('[SHUTDOWN] Sessions cleaned up');
-  } catch (e) {
-    console.error('[SHUTDOWN] session cleanup error:', e);
-  }
-
-  // 3) Close browser + stop Xvfb (your BrowserManager.closeBrowser() should stop Xvfb too)
-  try {
-    await browserMgr.closeBrowser?.();
-    console.log('[SHUTDOWN] Browser/Xvfb closed');
-  } catch (e) {
-    console.error('[SHUTDOWN] browser close error:', e);
-    // Fallback: at least attempt Xvfb stop
-    try { browserMgr.stopXvfb?.(); } catch {}
-  }
-
-  // 4) Hard exit after grace period (prevents hanging forever)
-  const forceExitTimer = setTimeout(() => {
-    console.error('[SHUTDOWN] Force exiting after timeout');
-    process.exit(1);
-  }, 5000);
-  forceExitTimer.unref();
-
-  // If you got here, exit normally
-  process.exit(0);
+  return preparedPromise;
 }
 
-process.once('SIGINT', () => gracefulShutdown('SIGINT'));
-process.once('SIGTERM', () => gracefulShutdown('SIGTERM'));
+let globalXvfb = null;
 
-process.on('exit', () => {
-  try { browserMgr.stopXvfb?.(); } catch {}
+async function initApp() {
+  infoLog('[INIT] Starting up ...')
+
+  // Prepare Cloakbrowser
+  await prepareOnce();
+
+  // Start Xvfb Synchronously on Linux (Guaranteed before server listens)
+  if (process.platform === 'linux') {
+    //console.log('[INIT] Starting Xvfb...');
+    try {
+      globalXvfb = new Xvfb({
+        silent: true,
+        xvfb_args: ['-screen', '0', '1920x1080x24', '-ac', '-nolisten', 'tcp'],
+      });
+      globalXvfb.startSync();
+      await new Promise(r => setTimeout(r, 500));
+      infoLog('[INIT] Xvfb started on display:', process.env.DISPLAY || ':99');
+    } catch (err) {     
+      // Option A: Fallback to headless mode if Xvfb fails (keeps server running)
+      if (err.message.includes('already in use') || err.message.includes('locked')) {
+        infoLog('[INIT] Display already running, proceeding with existing Xvfb.');
+        globalXvfb = null; // Don't try to stop something we didn't start
+      } 
+      // Option B: Fatal exit if headful is required (recommended for CloakBrowser stealth)
+      else {
+        console.error('[INIT] ⚠️ Xvfb failed to start:', err.message);
+        process.exit(1);
+      }
+    }
+  }
+
+  // Start Express Server
+  const server = http.createServer(app);
+  server.on('error', (err) => console.error('[SERVER_ERROR]', err));
+  server.on('clientError', (err, socket) => {
+    console.error('[CLIENT_ERROR]', err?.message || err);
+    try { socket.end('HTTP/1.1 400 Bad Request\r\n\r\n'); } catch {}
+  });
+
+  server.listen(PORT, () => {
+    infoLog(`[APP] HLS playlist resolver and proxy listening on ${PORT}`);
+  });
+
+  // Attach Graceful Shutdown
+  attachShutdownHandlers(server);
+}
+
+function attachShutdownHandlers(server) {
+  let shuttingDown = false;
+
+  async function gracefulShutdown(signal = 'SIGINT') {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    infoLog(`[SHUTDOWN] Received ${signal}, cleaning up...`);
+
+    try { await new Promise(r => server.close(r)); } catch {}
+    try { await Promise.allSettled(Array.from(SESSIONS.values()).map(s => s.cleanup?.())); } catch {}
+    try { await browserMgr.closeBrowser(); } catch {}
+    try { if (globalXvfb) { globalXvfb.stopSync(); log('[SHUTDOWN] Xvfb stopped'); } } catch {}
+
+    process.exit(0);
+  }
+
+  process.once('SIGINT', () => gracefulShutdown('SIGINT'));
+  process.once('SIGTERM', () => gracefulShutdown('SIGTERM'));
+  process.on('exit', () => { try { globalXvfb?.stopSync(); } catch {} });
+}
+
+// Run initialization (replaces direct server.listen())
+initApp().catch(err => {
+  console.error('[INIT] Fatal startup error:', err);
+  process.exit(1);
 });
-
-
-

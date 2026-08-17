@@ -75,12 +75,14 @@ let ALLOWED_HOSTS = new Set([
   'modifiles.fans',
   'vidfast.pro',
   'ppv.to',
+  'ppv.st',
   'embed.ppv.to',
   '111movies.net',
   'hexa.su',
   'flixer.su',
   'dlstreams.top',
   'vidcore.net',
+  'vidcore.io',
 ]);
 
 function hostMatchesAllowed(host) {
@@ -203,6 +205,7 @@ function rewriteMasterPlaylist(lines, baseUrl, req, sid) {
   return out;
 }
 
+// AES key uri rewriting
 function rewriteExtXKeyUriToProxy(line, baseUrl, req, sid) {
   if (!line.startsWith('#EXT-X-KEY')) return line;
 
@@ -407,7 +410,7 @@ const browserMgr = new BrowserManager();
 
 async function maybeCloseBrowserIfIdle() {
   if (SESSIONS.size === 0 && browserMgr.browser) {
-    await browserMgr.closeBrowser();
+    await browserMgr.forceClose();
     log('[BROWSER] Closed (no active sessions)');
   }
 }
@@ -434,8 +437,14 @@ setInterval(() => {
 }, 15_000).unref();
 
 async function createSession({
-  embedUrl, referer, origin, ua, idleMs, m3u8Match,
+  embedUrl,
+  referer,
+  origin,
+  ua,
+  idleMs,
+  m3u8Match,
   collectCount = 1,
+  resolveOnly = false,
   timeoutMs = process.platform === 'linux' ? 60_000 : 45_000
 }) {
   const ctx = await browserMgr.newContext();
@@ -453,34 +462,46 @@ async function createSession({
 
   const embedHost = new URL(embedUrl).host;
 
+  // When true, new requests are aborted.
+  // Used for resolve_only mode to stop HLS segment downloads.
+  let stopRequests = false;
+
   await page.setRequestInterception(true);
 
   const requestHandler = async (req) => {
     try {
+      // Stop further segment/media requests after capture is complete.
+      if (stopRequests) {
+        return req.abort();
+      }
+
       const urlStr = req.url();
-      
-      if (urlStr.startsWith('data:') ||
-          urlStr.startsWith('chrome:') ||
-          urlStr.startsWith('chrome-extension:') ||
-          urlStr.includes('amazonaws.com/cam.edu') ||
-          urlStr.includes('/ads') ||
-          urlStr.includes('google-') ||
-          urlStr.includes('wsrv.nl') ||
-          urlStr.includes('pixelsee.app') ||
-          urlStr.includes('openshield') ||
-          urlStr.includes('canatrace') ||
-          urlStr.includes('deuxseethe') ||
-          urlStr.includes('appsflyersdk.com') ||
-          urlStr.includes('ndcertainlywhen.com') ||
-          urlStr.includes('pwrgamerz.com') ||
-          urlStr.includes('usrpubtrk.com') ||
-          urlStr.includes('unwrapsstow')
-        ) {
+
+      if (
+        urlStr.startsWith('data:') ||
+        urlStr.startsWith('chrome:') ||
+        urlStr.startsWith('chrome-extension:') ||
+        urlStr.includes('amazonaws.com/cam.edu') ||
+        urlStr.includes('/ads') ||
+        urlStr.includes('google-') ||
+        urlStr.includes('wsrv.nl') ||
+        urlStr.includes('pixelsee.app') ||
+        urlStr.includes('openshield') ||
+        urlStr.includes('canatrace') ||
+        urlStr.includes('deuxseethe') ||
+        urlStr.includes('appsflyersdk.com') ||
+        urlStr.includes('ndcertainlywhen.com') ||
+        urlStr.includes('pwrgamerz.com') ||
+        urlStr.includes('usrpubtrk.com') ||
+        urlStr.includes('unwrapsstow')
+      ) {
         return req.abort();
       }
 
       let host = '';
-      try { host = new URL(urlStr).host; } catch {}
+      try {
+        host = new URL(urlStr).host;
+      } catch {}
 
       const type = req.resourceType();
       const isDoc = type === 'document' || req.isNavigationRequest();
@@ -488,29 +509,45 @@ async function createSession({
       const isMainFrame = frame === page.mainFrame();
       const isNav = isDoc && isMainFrame;
 
-      if (isNav && !hostMatchesAllowed(host) && host !== embedHost && !host.endsWith('.' + embedHost)) {
+      if (
+        isNav &&
+        !hostMatchesAllowed(host) &&
+        host !== embedHost &&
+        !host.endsWith('.' + embedHost)
+      ) {
         return req.abort();
       }
 
       return req.continue();
     } catch {
-      try { req.continue(); } catch {}
+      try {
+        req.continue();
+      } catch {}
     }
   };
 
   const cache = new Map();
   const waiters = new Map();
   const requestMeta = new Map();
+
   const collectedUrls = [];
   const seenUrls = new Set();
+
   let collectedResolve;
   const collectedPromise = new Promise((r) => (collectedResolve = r));
 
   function collectUrl(url) {
     if (!url) return;
     if (seenUrls.has(url)) return;
+
     seenUrls.add(url);
     collectedUrls.push(url);
+
+    // In resolve_only mode, stop new requests once enough playlists are seen.
+    if (resolveOnly && collectedUrls.length >= collectCount) {
+      stopRequests = true;
+    }
+
     if (collectedResolve && collectedUrls.length >= collectCount) {
       collectedResolve(collectedUrls.slice(0, collectCount));
       collectedResolve = null;
@@ -522,17 +559,22 @@ async function createSession({
 
   const responseHandler = async (res) => {
     try {
-
       const url = res.url();
-      if (url.startsWith('data:') ||
-          url.startsWith('chrome:') ||
-          url.includes('ads') ||
-          url.startsWith('chrome-extension:')) return;
+
+      if (
+        url.startsWith('data:') ||
+        url.startsWith('chrome:') ||
+        url.includes('ads') ||
+        url.startsWith('chrome-extension:')
+      ) return;
 
       const rq = res.request();
       log(`[${rq.method()}]`, url, res.status());
 
-      if (url.toLowerCase().includes('/verify')) log('[RESP TEXT]', await res.text());
+      // Avoid unnecessary body downloads in resolve_only mode.
+      if (url.toLowerCase().includes('/verify') && !resolveOnly) {
+        log('[RESP TEXT]', await res.text());
+      }
 
       const ct = (res.headers()['content-type'] || '').toLowerCase();
 
@@ -548,15 +590,17 @@ async function createSession({
 
       collectUrl(url);
 
-      const req = res.request?.();      
+      const req = res.request?.();
       const reqMethod = req?.method?.() || 'UNKNOWN';
       const reqHeaders = req?.headers?.() || {};
       const frameUrl = req?.frame?.()?.url?.() || '';
       const refererHdr = reqHeaders['referer'] || '';
-      const originHdr  = reqHeaders['origin']  || '';
+      const originHdr = reqHeaders['origin'] || '';
 
       let postData = null;
-      try { postData = req?.postData?.() ?? null; } catch {}
+      try {
+        postData = req?.postData?.() ?? null;
+      } catch {}
 
       requestMeta.set(url, {
         reqMethod,
@@ -568,8 +612,24 @@ async function createSession({
         ts: nowMs(),
       });
 
-      const text = await res.text();
-      const entry = { text, status: res.status(), headers: res.headers(), ts: nowMs() };
+      // IMPORTANT:
+      // status and headers are already available here.
+      // For resolve_only, we do NOT need the .m3u8 body.
+      let text = '';
+
+      if (!resolveOnly) {
+        try {
+          text = await res.text();
+        } catch {}
+      }
+
+      const entry = {
+        text,
+        status: res.status(),
+        headers: res.headers(),
+        ts: nowMs()
+      };
+
       cache.set(url, entry);
 
       if (firstResolve) {
@@ -591,6 +651,7 @@ async function createSession({
   page.on('request', requestHandler);
 
   const sid = newSid();
+
   const session = {
     sid,
     ctx,
@@ -605,13 +666,16 @@ async function createSession({
     cache,
     waiters,
     requestMeta,
+
     async waitForUrl(url, timeoutMsWait = 10000) {
       const existing = cache.get(url);
       if (existing) return existing;
+
       return new Promise((resolve) => {
         const set = waiters.get(url) || new Set();
         set.add(resolve);
         waiters.set(url, set);
+
         setTimeout(() => {
           const cur = waiters.get(url);
           if (cur && cur.has(resolve)) {
@@ -622,21 +686,22 @@ async function createSession({
         }, timeoutMsWait);
       });
     },
+
     async cleanup() {
       try {
-        // Explicit listener removal
         page.off('response', responseHandler);
         page.off('request', requestHandler);
-        
-        // Disable interception before closing
+
         await page.setRequestInterception(false).catch(() => {});
-        
         await page.close();
       } catch (e) {
         if (DEFAULT_LOG_ON) errorLog('[SESSION] Page close error:', e?.message);
       }
+
       if (ctx?.close) {
-        try { await ctx.close(); } catch {}
+        try {
+          await ctx.close();
+        } catch {}
       }
     },
   };
@@ -646,10 +711,12 @@ async function createSession({
   const deadline = nowMs() + timeoutMs;
   const timeLeft = () => Math.max(0, deadline - nowMs());
 
-  infoLog('[APP] Reveived request for', embedUrl);
+  infoLog('[APP] Received request for', embedUrl);
 
-  await page.goto(embedUrl, {
-    waitUntil: 'networkidle2',
+  // Do NOT await networkidle2.
+  // HLS players keep downloading segments, so networkidle2 may never happen.
+  page.goto(embedUrl, {
+    waitUntil: 'domcontentloaded',
     ...(referer ? { referer } : {}),
     timeout: timeLeft(),
   }).catch(() => {});
@@ -659,14 +726,27 @@ async function createSession({
     new Promise((r) => setTimeout(() => r(null), timeLeft())),
   ]);
 
-  if (collectCount > 1) {
+  if (collectCount > 1 && firstPlaylist) {
     await Promise.race([
       collectedPromise,
       new Promise((r) => setTimeout(() => r(null), timeLeft())),
     ]);
   }
 
-  return { sid, session, firstPlaylist, collectedUrls: collectedUrls.slice(0, collectCount) };
+  if (resolveOnly) {
+    stopRequests = true;
+
+    // Optional: ask the page itself to stop loading.
+    // Not awaited because we do not want to block.
+    page.evaluate(() => window.stop()).catch(() => {});
+  }
+
+  return {
+    sid,
+    session,
+    firstPlaylist,
+    collectedUrls: collectedUrls.slice(0, collectCount)
+  };
 }
 
 // function getSessionOrThrow(sid) {
@@ -768,10 +848,14 @@ app.get('/playlist', async (req, res) => {
       const recordsCount = resolveOnly ? parseRecordsCount(req, 1) : 1;
 
       const { sid: newSid, session, firstPlaylist, collectedUrls } = await createSession({
-        embedUrl, referer, origin, ua,
+        embedUrl,
+        referer,
+        origin,
+        ua,
         idleMs,
         m3u8Match,
         collectCount: recordsCount,
+        resolveOnly,
         timeoutMs: 45_000,
       });
 
@@ -789,6 +873,10 @@ app.get('/playlist', async (req, res) => {
             .set('Cache-Control', 'no-store, must-revalidate')
             .set('Content-Type', 'text/plain; charset=utf-8')
             .send('Failed to capture any matching playlist');
+          
+          // Do not block the HTTP response on browser shutdown.
+          maybeCloseBrowserIfIdle().catch(() => {});
+
           return;
         }
 
@@ -797,7 +885,7 @@ app.get('/playlist', async (req, res) => {
           try { playlistCookies = await session.page.cookies(u); } catch {}
           const cookieHeader = cookiesToHeader(playlistCookies);
           const meta = session.requestMeta?.get(u);
-          const cachedEntry = session.cache?.get(u); // ✅ Fetch cached response to get status
+          const cachedEntry = session.cache?.get(u); //Fetch cached response to get status
           
           const realReferer = meta?.referer || session.referer || '';
           const realOrigin  = meta?.origin  || session.origin  || '';
@@ -812,7 +900,9 @@ app.get('/playlist', async (req, res) => {
           
           return {
             url: u,
-            status: cachedEntry?.status ?? null, // ✅ Include HTTP status code
+            status: cachedEntry?.status ?? null, //Include HTTP response status code
+            //responseHeaders: cachedEntry?.headers ?? null, // Actual .m3u8 HTTP response headers
+            // Request side fields
             method: meta?.reqMethod || null,
             headers,
             body: meta?.postData ?? null,
@@ -820,36 +910,64 @@ app.get('/playlist', async (req, res) => {
           };
         }));
 
-        try { await session.cleanup?.(); } catch {}
+        // Stop the page quickly, but do not let cleanup hang the response forever.
+        try {
+          await Promise.race([
+            session.cleanup?.(),
+            new Promise(r => setTimeout(r, 2000))
+          ]);
+        } catch {}
+
         SESSIONS.delete(newSid);
-        await maybeCloseBrowserIfIdle();
 
         res.status(200)
           .set('Cache-Control', 'no-store, must-revalidate')
           .json({ ok: true, records });
+
+        // Close browser in the background if idle.
+        maybeCloseBrowserIfIdle().catch(() => {});
+
         return;
       }
 
       if (!firstPlaylist?.url) {
-        try { await session.cleanup?.(); } catch {}
-        try { SESSIONS.delete(newSid); } catch {}
-        await maybeCloseBrowserIfIdle();
+        try {
+          await Promise.race([
+            session.cleanup?.(),
+            new Promise(r => setTimeout(r, 2000))
+          ]);
+        } catch {}
+
+        SESSIONS.delete(newSid);
+
         res.status(502)
           .set('Cache-Control', 'no-store, must-revalidate')
           .set('Content-Type', 'text/plain; charset=utf-8')
           .send(`Failed to capture first playlist for embed.\n${firstPlaylist?.error || 'empty'}`);
+
+        maybeCloseBrowserIfIdle().catch(() => {});
+
         return;
       }
 
-      // ✅ Abort and forward error status if the initial embed playlist failed
+      // Abort and forward error status if the initial embed playlist failed
       if (firstPlaylist.status >= 400) {
-        try { await session.cleanup?.(); } catch {}
-        try { SESSIONS.delete(newSid); } catch {}
-        await maybeCloseBrowserIfIdle();
+        try {
+          await Promise.race([
+            session.cleanup?.(),
+            new Promise(r => setTimeout(r, 2000))
+          ]);
+        } catch {}
+
+        SESSIONS.delete(newSid);
+
         res.status(firstPlaylist.status)
           .set('Cache-Control', 'no-store, must-revalidate')
           .set('Content-Type', 'text/plain; charset=utf-8')
           .send(`Upstream embed playlist returned error status: ${firstPlaylist.status}`);
+
+        maybeCloseBrowserIfIdle().catch(() => {});
+
         return;
       }
 
@@ -889,12 +1007,12 @@ app.get('/playlist', async (req, res) => {
       return;
     }
 
-    if (!upstream || !upstream.text) {
-      res.status(502).send('Empty upstream playlist');
+    if (!upstream) {
+      res.status(502).send('Empty upstream playlist response');
       return;
     }
 
-    // ✅ Stop proxying and forward the exact error status to the client
+    // Forward upstream 4xx/5xx status to the client.
     if (upstream.status >= 400) {
       res.status(upstream.status)
         .set('Cache-Control', 'no-store, must-revalidate')
@@ -939,6 +1057,7 @@ app.get('/playlist', async (req, res) => {
   }
 });
 
+// For AES key uri rewriting
 app.get('/key', async (req, res) => {
   try {
     const sid = req.query.sid?.toString();
@@ -988,7 +1107,7 @@ app.get('/key', async (req, res) => {
       return;
     }
 
-    // ✅ Stop proxying and forward the exact error status to the client
+    // Stop proxying and forward the exact error status to the client
     if (upstream.status >= 400) {
       res.status(upstream.status)
         .set('Cache-Control', 'no-store, must-revalidate')

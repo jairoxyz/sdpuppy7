@@ -12,9 +12,9 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "cloakbrowser": "^0.5.4",
+    "cloakbrowser": "^0.5.7",
     "express": "^5.2.1",
-    "puppeteer-core": "^25.5.0",
+    "puppeteer-core": "^25.7.0",
     "undici": "^7.18.2",
     "xvfb": "^0.4.0"
   },
