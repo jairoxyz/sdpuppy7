@@ -83,6 +83,8 @@ let ALLOWED_HOSTS = new Set([
   'dlstreams.top',
   'vidcore.net',
   'vidcore.io',
+  'flixer.gd',
+  'gn1r5n.org'
 ]);
 
 function hostMatchesAllowed(host) {
@@ -327,7 +329,7 @@ class BrowserManager {
           headless,
           humanize: true,
           geoip: false,
-          humanPreset: 'careful',  // ✅ Critical for stability
+          humanPreset: 'careful',  // Critical for stability
           protocolTimeout: 45_000,
           args: [
             '--no-sandbox',
@@ -335,7 +337,8 @@ class BrowserManager {
             '--disable-dev-shm-usage',
             '--disable-gpu',
             '-window-size=1280,720',
-            '--fingerprint=12345',  // ✅ Fixed fingerprint prevents conflicts
+            '--fingerprint=12345',  // Fixed fingerprint prevents conflicts
+            '--autoplay-policy=no-user-gesture-required', // Allow autoplay without click
           ],
           defaultViewport: { width: 1280, height: 720 },
         });
@@ -445,16 +448,26 @@ async function createSession({
   m3u8Match,
   collectCount = 1,
   resolveOnly = false,
+  useClicker = false,
   timeoutMs = process.platform === 'linux' ? 60_000 : 45_000
 }) {
   const ctx = await browserMgr.newContext();
   const page = await ctx.newPage();
+
+  // Kill popups when ad clicker is active
+  if (useClicker) {
+    page.on('popup', async (popup) => {
+      log('[POPUP] Closing ad popup');
+      try { await popup.close(); } catch {}
+    });
+  }
 
   page.on('error', (e) => console.error('[PAGE_ERROR]', e));
   page.on('pageerror', (e) => console.error('[PAGE_PAGEERROR]', e));
 
   await page.setUserAgent(ua || DEFAULT_UA);
   await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
+
 
   const matchSub = (m3u8Match != null && String(m3u8Match).trim() !== '')
     ? String(m3u8Match)
@@ -477,6 +490,7 @@ async function createSession({
 
       const urlStr = req.url();
 
+         // 1. Hard abort for junk, trackers, and broken domains
       if (
         urlStr.startsWith('data:') ||
         urlStr.startsWith('chrome:') ||
@@ -497,7 +511,7 @@ async function createSession({
       ) {
         return req.abort();
       }
-
+      
       let host = '';
       try {
         host = new URL(urlStr).host;
@@ -571,7 +585,6 @@ async function createSession({
       const rq = res.request();
       log(`[${rq.method()}]`, url, res.status());
 
-      // Avoid unnecessary body downloads in resolve_only mode.
       if (url.toLowerCase().includes('/verify') && !resolveOnly) {
         log('[RESP TEXT]', await res.text());
       }
@@ -715,16 +728,76 @@ async function createSession({
 
   // Do NOT await networkidle2.
   // HLS players keep downloading segments, so networkidle2 may never happen.
-  page.goto(embedUrl, {
+    page.goto(embedUrl, {
     waitUntil: 'domcontentloaded',
     ...(referer ? { referer } : {}),
     timeout: timeLeft(),
   }).catch(() => {});
 
+  let clicking = false;
+
+  // Only run the clicker if explicitly requested via &clicker=true
+  if (useClicker) {
+    clicking = true;
+    
+    // SMART CLICKER LOOP: Automates the "Verify -> Ad -> Real Player" flow
+    const clickerLoop = (async () => {
+      let centerClicks = 0;
+      // Keep clicking until we get the m3u8 or time runs out
+      while (clicking && timeLeft() > 2000) {
+        try {
+          // 1. Look for specific text buttons on the main page
+          const box = await page.evaluate(() => {
+            const els = Array.from(document.querySelectorAll('button, a, div[role="button"], span, div'));
+            for (const el of els) {
+              const text = (el.innerText || '').toLowerCase();
+              // Match the ad-gate and real player buttons
+              if (
+                text.includes('verify') || text.includes('play') || 
+                text.includes('continue') || text.includes('click') || 
+                text.includes('human') || text.includes('start')
+              ) {
+                const rect = el.getBoundingClientRect();
+                // Ensure it's visible and reasonably sized
+                if (rect.width > 30 && rect.height > 20 && rect.top >= 0 && rect.left >= 0) {
+                  return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+                }
+              }
+            }
+            return null;
+          });
+
+          if (box) {
+            // Move mouse like a human, then click
+            await page.mouse.move(box.x, box.y, { steps: 5 });
+            await new Promise(r => setTimeout(r, 150));
+            await page.mouse.click(box.x, box.y);
+            log('[CLICK] Clicked text button at', box);
+            centerClicks = 0; // Reset fallback counter
+          } else if (centerClicks < 3) {
+            // 2. Fallback: Click the center of the screen (hits iframe overlays)
+            // We limit this to 3 times so we don't spam-click the real player once it loads
+            await page.mouse.click(640, 360);
+            log('[CLICK] Clicked center fallback');
+            centerClicks++;
+          }
+        } catch (e) {
+          // Page might be navigating or closed, ignore
+        }
+        
+        // Wait 2 seconds before next click attempt
+        await new Promise(r => setTimeout(r, 2000)); 
+      }
+    })();
+  }
+
   const firstPlaylist = await Promise.race([
     firstPromise,
     new Promise((r) => setTimeout(() => r(null), timeLeft())),
   ]);
+
+  // Stop the clicker loop once we have the playlist (or timeout)
+  if (useClicker) clicking = false;
 
   if (collectCount > 1 && firstPlaylist) {
     await Promise.race([
@@ -843,6 +916,7 @@ app.get('/playlist', async (req, res) => {
 
     if (isEmbedRequest) {
       const resolveOnly = isTruthy(req.query.resolve_only);
+      const useClicker = isTruthy(req.query.clicker);
       const idleMs = parseIdleMs(req);
       const m3u8Match = req.query.m3u8_match?.toString() || '';
       const recordsCount = resolveOnly ? parseRecordsCount(req, 1) : 1;
@@ -856,6 +930,7 @@ app.get('/playlist', async (req, res) => {
         m3u8Match,
         collectCount: recordsCount,
         resolveOnly,
+        useClicker,
         timeoutMs: 45_000,
       });
 

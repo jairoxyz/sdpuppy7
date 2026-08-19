@@ -18,6 +18,10 @@ http://localhost:3999/playlist?embed=some_embed_url&referer=some_site&resolve_on
 
 http://localhost:3999/playlist?embed=some_embed_url&referer=some_site&idle=secs
 
+**Extract playlist for ad-gated sites with click button**
+
+http://localhost:3999/playlist?embed=some_embed_url&referer=some_site&resolve_only=1&clicker=1
+
 
 
 
