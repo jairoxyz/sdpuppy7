@@ -5,7 +5,7 @@ import dns from 'node:dns';
 import { URL } from 'node:url';
 import crypto from 'node:crypto';
 
-// ✅ CloakBrowser import (drop-in Puppeteer replacement)
+// CloakBrowser import (drop-in Puppeteer replacement)
 //import { launch } from 'cloakbrowser/puppeteer';
 import { ensureBinary, clearCache, binaryInfo } from 'cloakbrowser';
 import { ensureAndPruneCloakbrowserCache } from './cloakbrowserCache.js';
@@ -14,15 +14,6 @@ import { ensureAndPruneCloakbrowserCache } from './cloakbrowserCache.js';
 import Xvfb from 'xvfb';
 import { error } from 'node:console';
 import { userInfo } from 'node:os';
-
-// --- Hardening: keep process alive on unexpected async errors ---
-process.on('unhandledRejection', (reason) => {
-  console.error('[UNHANDLED_REJECTION]', reason);
-});
-
-process.on('uncaughtException', (err) => {
-  console.error('[UNCAUGHT_EXCEPTION]', err);
-});
 
 // --- Networking defaults ---
 dns.setDefaultResultOrder('ipv4first');
@@ -62,38 +53,53 @@ const ALLOWLIST = (process.env.ALLOWLIST || '')
   .filter(Boolean);
 
 let ALLOWED_HOSTS = new Set([
-  'streamed.pk',
-  'embedsports.top',
-  'embedsporty.top',
-  'embedstreams.top',
+  'streamed.*',
+  'embedsports.*',
+  'embedsporty.*',
+  'embedstreams.*',
   'embed.st',
   'embedhd.st',
-  'strmd.top',
-  'poocloud.in',
-  'pooembed.eu',
-  'embedindia.st',
-  'modifiles.fans',
-  'vidfast.pro',
-  'ppv.to',
-  'ppv.st',
-  'embed.ppv.to',
-  '111movies.net',
-  'hexa.su',
-  'flixer.su',
-  'dlstreams.top',
-  'vidcore.net',
-  'vidcore.io',
-  'flixer.gd',
+  'strmd.*',
+  'poocloud.*',
+  'pooembed.*',
+  'embedindia.*',
+  'modifiles.*',
+  'vidfast.*',
+  'ppv.*',
+  'embed.ppv.*',
+  '111movies.*',
+  'hexa.*',
+  'flixer.*',
+  'dlstreams.*',
+  'vidcore.*',
   'gn1r5n.org'
 ]);
 
 function hostMatchesAllowed(host) {
   if (!ALLOWED_HOSTS || ALLOWED_HOSTS.size === 0) return true;
   if (!host) return false;
-  const h = host.toLowerCase();
+  const h = host.toLowerCase();  
+  
   for (const base of ALLOWED_HOSTS) {
-    const b = base.toLowerCase();
-    if (h === b || h.endsWith('.' + b)) return true;
+    const b = base.toLowerCase();    
+    
+    // 1. Standard exact match or subdomain match (e.g., 'vidfast.pro' matches 'sub.vidfast.pro')
+    if (h === b || h.endsWith('.' + b)) return true;    
+    
+    // 2. Wildcard match with dot (e.g., 'vidcore.*' or 'vidfast.*')
+    if (b.endsWith('.*')) {
+      const prefix = b.slice(0, -1); // removes '*', leaves 'vidcore.'
+      if (h.startsWith(prefix) || h.includes('.' + prefix)) {
+        return true;
+      }
+    } 
+    // 3. Wildcard match without dot (e.g., 'vidcore*')
+    else if (b.endsWith('*')) {
+      const prefix = b.slice(0, -1); // removes '*', leaves 'vidcore'
+      if (h.startsWith(prefix) || h.includes('.' + prefix)) {
+        return true;
+      }
+    }
   }
   return false;
 }
@@ -321,7 +327,7 @@ class BrowserManager {
           this.browser = null;
         }
 
-        const headless = process.platform === 'linux' ? false : true;
+        const headless = process.platform === 'linux' ? false : false;
         if (!headless) this.ensureXvfb();
 
         // Launch with working-script settings
@@ -507,7 +513,8 @@ async function createSession({
         urlStr.includes('ndcertainlywhen.com') ||
         urlStr.includes('pwrgamerz.com') ||
         urlStr.includes('usrpubtrk.com') ||
-        urlStr.includes('unwrapsstow')
+        urlStr.includes('unwrapsstow') ||
+        urlStr.includes('kuronix.app')
       ) {
         return req.abort();
       }
@@ -522,9 +529,13 @@ async function createSession({
       const frame = req.frame();
       const isMainFrame = frame === page.mainFrame();
       const isNav = isDoc && isMainFrame;
+      const isRedirect = req.redirectChain().length > 0;
 
+      // Allow HTTP redirects (301/302/307/308) to pass through to new domains.
+      // We only block fresh, JS-initiated top-level navigations to unknown hosts (usually ads)
       if (
         isNav &&
+        !isRedirect &&
         !hostMatchesAllowed(host) &&
         host !== embedHost &&
         !host.endsWith('.' + embedHost)
@@ -1294,6 +1305,27 @@ async function initApp() {
   attachShutdownHandlers(server);
 }
 
+// function attachShutdownHandlers(server) {
+//   let shuttingDown = false;
+
+//   async function gracefulShutdown(signal = 'SIGINT') {
+//     if (shuttingDown) return;
+//     shuttingDown = true;
+//     infoLog(`[SHUTDOWN] Received ${signal}, cleaning up...`);
+
+//     try { await new Promise(r => server.close(r)); } catch {}
+//     try { await Promise.allSettled(Array.from(SESSIONS.values()).map(s => s.cleanup?.())); } catch {}
+//     try { await browserMgr.closeBrowser(); } catch {}
+//     try { if (globalXvfb) { globalXvfb.stopSync(); log('[SHUTDOWN] Xvfb stopped'); } } catch {}
+
+//     process.exit(0);
+//   }
+
+//   process.once('SIGINT', () => gracefulShutdown('SIGINT'));
+//   process.once('SIGTERM', () => gracefulShutdown('SIGTERM'));
+//   process.on('exit', () => { try { globalXvfb?.stopSync(); } catch {} });
+// }
+
 function attachShutdownHandlers(server) {
   let shuttingDown = false;
 
@@ -1302,17 +1334,61 @@ function attachShutdownHandlers(server) {
     shuttingDown = true;
     infoLog(`[SHUTDOWN] Received ${signal}, cleaning up...`);
 
-    try { await new Promise(r => server.close(r)); } catch {}
-    try { await Promise.allSettled(Array.from(SESSIONS.values()).map(s => s.cleanup?.())); } catch {}
-    try { await browserMgr.closeBrowser(); } catch {}
-    try { if (globalXvfb) { globalXvfb.stopSync(); log('[SHUTDOWN] Xvfb stopped'); } } catch {}
+    // Hard timeout: if cleanup hangs for more than 5 seconds, force kill the process.
+    // This prevents zombie CloakBrowser processes from staying alive.
+    const forceExitTimer = setTimeout(() => {
+      console.error('[SHUTDOWN] Cleanup took too long, forcing exit.');
+      process.exit(1);
+    }, 5000);
+    forceExitTimer.unref();
 
-    process.exit(0);
+    try { await new Promise(r => server.close(r)); } catch {}
+    
+    try { 
+      await Promise.allSettled(Array.from(SESSIONS.values()).map(s => s.cleanup?.())); 
+    } catch {}
+    
+    // Use forceClose() instead of closeBrowser() to ensure it doesn't hang
+    try { await browserMgr.forceClose(); } catch {}
+    
+    try { 
+      if (globalXvfb) { 
+        globalXvfb.stopSync(); 
+        log('[SHUTDOWN] Xvfb stopped'); 
+      } 
+    } catch {}
+
+    clearTimeout(forceExitTimer);
+    
+    // Exit with error code 1 if it was a crash, 0 for normal shutdown
+    const exitCode = (signal === 'uncaughtException' || signal === 'unhandledRejection') ? 1 : 0;
+    process.exit(exitCode);
   }
 
-  process.once('SIGINT', () => gracefulShutdown('SIGINT'));
-  process.once('SIGTERM', () => gracefulShutdown('SIGTERM'));
-  process.on('exit', () => { try { globalXvfb?.stopSync(); } catch {} });
+  // 1. Standard OS signals
+  process.once('SIGINT', () => gracefulShutdown('SIGINT'));   // Ctrl+C
+  process.once('SIGTERM', () => gracefulShutdown('SIGTERM')); // kill / VS Code Stop / Docker stop
+  process.once('SIGHUP', () => gracefulShutdown('SIGHUP'));   // Terminal window closed
+  process.once('SIGQUIT', () => gracefulShutdown('SIGQUIT')); // Ctrl+\
+
+  // 2. Node.js crashes
+  process.on('uncaughtException', (err) => {
+    console.error('[UNCAUGHT_EXCEPTION]', err);
+    gracefulShutdown('uncaughtException');
+  });
+
+  process.on('unhandledRejection', (reason) => {
+    console.error('[UNHANDLED_REJECTION]', reason);
+    gracefulShutdown('unhandledRejection');
+  });
+
+  // 3. Event loop empties naturally
+  process.on('beforeExit', () => gracefulShutdown('beforeExit'));
+
+  // 4. Synchronous exit fallback (only for sync operations like Xvfb)
+  process.on('exit', () => { 
+    try { globalXvfb?.stopSync(); } catch {} 
+  });
 }
 
 // Run initialization (replaces direct server.listen())
