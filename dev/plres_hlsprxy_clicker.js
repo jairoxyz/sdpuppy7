@@ -4,7 +4,6 @@ import http from 'http';
 import dns from 'node:dns';
 import { URL } from 'node:url';
 import crypto from 'node:crypto';
-import { startClickerLoop } from './clicker.js';
 
 // CloakBrowser import (drop-in Puppeteer replacement)
 //import { launch } from 'cloakbrowser/puppeteer';
@@ -462,6 +461,14 @@ async function createSession({
   const ctx = await browserMgr.newContext();
   const page = await ctx.newPage();
 
+  // Kill popups when ad clicker is active
+  if (useClicker) {
+    page.on('popup', async (popup) => {
+      log('[POPUP] Closing ad popup');
+      try { await popup.close(); } catch {}
+    });
+  }
+
   page.on('error', (e) => console.error('[PAGE_ERROR]', e));
   page.on('pageerror', (e) => console.error('[PAGE_PAGEERROR]', e));
 
@@ -739,16 +746,185 @@ async function createSession({
     timeout: timeLeft(),
   }).catch(() => {});
 
-  let clicker = null;
+  let clicking = false;
+
   // Only run the clicker if explicitly requested via &clicker=true
   if (useClicker) {
-    // Keep the popup killer here so ad tabs don't steal focus
-    page.on('popup', async (popup) => {
-      log('[POPUP] Closing ad popup');
-      try { await popup.close(); } catch {}
-    });
-    // Start the clicker
-    clicker = startClickerLoop({ page, timeLeft, log });
+    clicking = true;
+    
+    // SMART CLICKER LOOP: Automates the "Verify -> Ad -> Real Player" flow and overlay buttons
+    const clickerLoop = (async () => {
+      let centerClicks = 0;
+      let realClicks = 0;
+      // 1. Wait for the player UI to actually mount before scanning
+      try {
+        await page.waitForSelector('button, svg.lucide-play, [class*="play"]', { timeout: 5000 });
+      } catch {}      
+      // Give it a tiny bit more time to finish layout/animations
+      await new Promise(r => setTimeout(r, 500));
+      // Keep clicking until we get the m3u8 or time runs out
+      while (clicking && timeLeft() > 2000) {
+        try {
+          const box = await page.evaluate(() => {
+            const buttons = Array.from(document.querySelectorAll('button, div[role="button"], a'));     
+            // Helper: Check if element is in the center 60% of the screen
+            // (This naturally excludes bottom/top corner controls like Fullscreen/Volume)
+            const isCenterish = (rect) => {
+              const cx = rect.x + rect.width / 2;
+              const cy = rect.y + rect.height / 2;
+              return (
+                cx > window.innerWidth * 0.2 && cx < window.innerWidth * 0.8 &&
+                cy > window.innerHeight * 0.2 && cy < window.innerHeight * 0.8
+              );
+            };
+            // Text-based buttons (Verify, Play, Continue, etc.)
+            for (const el of buttons) {
+              const text = (el.innerText || el.textContent || '').toLowerCase().trim();
+              if (text && (
+                text.includes('verify') || text.includes('play') || 
+                text.includes('continue') || text.includes('click') || 
+                text.includes('human') || text.includes('start') ||
+                text.includes('watch')
+              )) {
+                const rect = el.getBoundingClientRect();
+                if (rect.width > 10 && rect.height > 10) {
+                  return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, type: 'text-btn' };
+                }
+              }
+            }
+            // Large, center-located buttons containing an SVG (Universal Play Button)
+            for (const btn of buttons) {
+              // Skip <a> tags that point to external websites
+              if (btn.tagName === 'A') {
+                const href = btn.getAttribute('href') || '';
+                if (href.startsWith('http') && !href.includes(window.location.hostname)) continue;
+              }
+              const hasSvg = btn.querySelector('svg');
+              const text = (btn.innerText || '').trim();              
+              // Must have an SVG, must NOT have text, must be reasonably large
+              if (hasSvg && text === '') {
+                const rect = btn.getBoundingClientRect();
+                // Play buttons are usually >= 40px. Corner controls are usually 24px-32px.
+                if (rect.width >= 40 && rect.height >= 40 && isCenterish(rect)) {
+                  return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, type: 'svg-btn' };
+                }
+              }
+            }            
+            // Fallback for large, central empty buttons (CSS shapes / Background images)
+            let bestEmptyBtn = null;
+            let maxArea = 0;
+            for (const btn of buttons) {
+              const hasSvg = btn.querySelector('svg');
+              const text = (btn.innerText || '').trim();              
+              // Must NOT have text, must NOT have SVG (otherwise caught by Priority 2)
+              if (text === '' && !hasSvg) {
+                const rect = btn.getBoundingClientRect();
+                const area = rect.width * rect.height;
+                
+                if (rect.width >= 40 && rect.height >= 40 && isCenterish(rect)) {
+                  if (area > maxArea) {
+                    maxArea = area;
+                    bestEmptyBtn = { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, type: 'center-btn' };
+                  }
+                }
+              }
+            }
+            if (bestEmptyBtn) return bestEmptyBtn;
+            return null;
+          });
+          if (box) {
+            // Move mouse like a human, then click
+            await page.mouse.move(box.x, box.y, { steps: 5 });
+            await new Promise(r => setTimeout(r, 150));
+            await page.mouse.click(box.x, box.y);
+            log(`[CLICK] Clicked ${box.type} at`, { x: box.x, y: box.y });
+            realClicks++; 
+          } else if (realClicks === 0 && centerClicks < 3) {
+            // Fallback: Click the center of the screen (hits iframe overlays)
+            // We limit this to 3 times so we don't spam-click the real player once it loads
+
+            // const hitInfo = await page.evaluate(() => {
+            //   const cx = Math.round(window.innerWidth / 2);
+            //   const cy = Math.round(window.innerHeight / 2);
+            //   const el = document.elementFromPoint(cx, cy);
+            //   if (!el) return { found: false, cx, cy };
+
+            //   // If it's an iframe, report its src (elementFromPoint can't see inside iframes)
+            //   if (el.tagName === 'IFRAME') {
+            //     return { found: true, cx, cy, tag: 'IFRAME', src: el.src || el.getAttribute('src') || '' };
+            //   }
+
+            //   // Walk up to the nearest "clickable-looking" ancestor
+            //   let clickable = el;
+            //   while (clickable && clickable !== document.body) {
+            //     const tag = (clickable.tagName || '').toLowerCase();
+            //     if (
+            //       tag === 'button' || tag === 'a' ||
+            //       clickable.getAttribute('role') === 'button' ||
+            //       typeof clickable.onclick === 'function'
+            //     ) break;
+            //     clickable = clickable.parentElement;
+            //   }
+            //   const target = (clickable && clickable !== document.body) ? clickable : el;
+            //   const rect = target.getBoundingClientRect();
+
+            //   return {
+            //     found: true,
+            //     cx, cy,
+            //     tag: target.tagName,
+            //     id: target.id || '',
+            //     cls: String(target.className || '').slice(0, 100),
+            //     text: (target.innerText || '').trim().slice(0, 60),
+            //     hasSvg: !!target.querySelector?.('svg'),
+            //     title: target.getAttribute?.('title') || '',
+            //     w: Math.round(rect.width),
+            //     h: Math.round(rect.height),
+            //   };
+            // }).catch(() => null);
+            // log('[CENTER-HIT]', JSON.stringify(hitInfo));
+
+            // Probe the ACTUAL viewport center so click lands where we inspect
+            const probe = await page.evaluate(() => {
+              const cx = Math.round(window.innerWidth / 2);
+              const cy = Math.round(window.innerHeight / 2);
+              const el = document.elementFromPoint(cx, cy);
+              const info = { cx, cy, found: false, loading: false, tag: '', text: '' };
+              if (!el) return info;
+              info.found = true;
+              info.tag = el.tagName;
+              info.text = (el.innerText || '').trim().slice(0, 80);
+              info.cls = String(el.className || '').slice(0, 100);
+              const t = info.text.toLowerCase();
+              info.loading =
+                t.includes('loading') || t.includes('almost ready') ||
+                t.includes('optimizing') || t.includes('please wait') ||
+                t.includes('buffering') || t.includes('preparing') ||
+                t.includes('just a moment') || t.includes('stand by');
+              return info;
+            }).catch(() => null);
+            if (!probe || !probe.found) {
+              // Couldn't probe; click nominal center as last resort
+              await page.mouse.click(640, 360);
+              centerClicks++;
+              log('[CLICK] Center fallback (no probe)');
+            } else if (probe.loading) {
+              // Loading/interstitial state — don't waste a center click
+              log('[CLICK-PROBE] Loading state, skipping:', probe.text.replace(/\s+/g, ' '));
+            } else {
+              log('[CLICK-PROBE]', JSON.stringify(probe));
+              await page.mouse.click(probe.cx, probe.cy); //click the SAME point we probed
+              centerClicks++;
+              log('[CLICK] Clicked center fallback');
+            }            
+          }
+        } catch (e) {
+          // Page might be navigating or closed, ignore
+        }
+        
+        // Wait 2 seconds before next click attempt
+        await new Promise(r => setTimeout(r, 2000)); 
+      }
+    })();
   }
 
   const firstPlaylist = await Promise.race([
@@ -757,9 +933,7 @@ async function createSession({
   ]);
 
   // Stop the clicker loop once we have the playlist (or timeout)
-  if (clicker) {
-    clicker.stop();
-  }
+  if (useClicker) clicking = false;
 
   if (collectCount > 1 && firstPlaylist) {
     await Promise.race([
