@@ -22,6 +22,10 @@ http://localhost:3999/playlist?embed=some_embed_url&referer=some_site&idle=secs
 
 http://localhost:3999/playlist?embed=some_embed_url&referer=some_site&resolve_only=1&clicker=1
 
+**Proxy stream segments**
+
+http://localhost:3999/playlist?embed=some_embed_url&referer=some_site&proxy_ts=1
+
 
 
 

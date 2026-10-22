@@ -1,95 +1,115 @@
 // clicker.js
 
-/**
- * Starts the smart clicker loop to bypass ad-gates and play buttons.
- * 
- * @param {Object} options
- * @param {import('puppeteer').Page} options.page - The Puppeteer/CloakBrowser page object.
- * @param {Function} options.timeLeft - Function returning remaining time in ms.
- * @param {Function} options.log - Logging function.
- * @returns {{ promise: Promise<void>, stop: Function }}
- */
 export function startClickerLoop({ page, timeLeft, log }) {
   let clicking = true;
-  let centerClicks = 0;
+  let ticks = 0;
+  let blindClicks = 0;
   let realClicks = 0;
 
   const promise = (async () => {
-    // 1. Wait for the player UI to actually mount before scanning
-    try {
-      await page.waitForSelector('button, svg.lucide-play, [class*="play"]', { timeout: 5000 });
-    } catch {}
+    log('[CLICK] Starting loop...');
     
-    // Give it a tiny bit more time to finish layout/animations
-    await new Promise(r => setTimeout(r, 500));
+    // Let the initial page scripts settle
+    await new Promise(r => setTimeout(r, 1000)); 
 
     while (clicking && timeLeft() > 2000) {
+      ticks++;
+      
       try {
-        const result = await page.evaluate(() => {
-          const buttons = Array.from(document.querySelectorAll('button, div[role="button"], a'));
-          
-          const isCenterish = (rect) => {
-            const cx = rect.x + rect.width / 2;
-            const cy = rect.y + rect.height / 2;
-            return (
-              cx > window.innerWidth * 0.2 && cx < window.innerWidth * 0.8 &&
-              cy > window.innerHeight * 0.2 && cy < window.innerHeight * 0.8
-            );
-          };
+        // 🚀 PHASE 1: Blind clicks to trigger ad chains (Ticks 1 & 2)
+        if (ticks <= 2) {
+           log(`[CLICK] Tick ${ticks}: Firing blind center click to clear ad gates...`);
+           await page.mouse.click(640, 360);
+           blindClicks++;
+           await new Promise(r => setTimeout(r, 2000));
+           continue; 
+        }
 
-          // Text-based buttons
-          for (const el of buttons) {
-            if (el.tagName === 'A') {
-              const href = el.getAttribute('href') || '';
-              if (href.startsWith('http') && !href.includes(window.location.hostname)) continue;
-            }
-            const text = (el.innerText || el.textContent || '').toLowerCase().trim();
-            if (text && (
-              text.includes('verify') || text.includes('play') || 
-              text.includes('continue') || text.includes('click') || 
-              text.includes('human') || text.includes('start') ||
-              text.includes('watch')
-            )) {
-              const rect = el.getBoundingClientRect();
-              if (rect.width > 10 && rect.height > 10) {
-                return { box: { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, type: 'text-btn' } };
-              }
-            }
-          }
+        // 🎯 PHASE 2: Smart DOM Scanner (Tick 3+)
+        // Wrapped in a 3-second timeout to prevent lock.wasm from freezing the loop
+        const result = await Promise.race([
+          page.evaluate(() => {
+            const buttons = Array.from(document.querySelectorAll('button, div[role="button"], a, [tabindex="0"]'));
+            
+            const isCenterish = (rect) => {
+              const cx = rect.x + rect.width / 2;
+              const cy = rect.y + rect.height / 2;
+              return (
+                cx > window.innerWidth * 0.15 && cx < window.innerWidth * 0.85 &&
+                cy > window.innerHeight * 0.15 && cy < window.innerHeight * 0.85
+              );
+            };
 
-          // Large, center-located SVG buttons
-          for (const btn of buttons) {
-            const hasSvg = btn.querySelector('svg');
-            const text = (btn.innerText || '').trim();
-            if (hasSvg && text === '') {
-              const rect = btn.getBoundingClientRect();
-              if (rect.width >= 40 && rect.height >= 40 && isCenterish(rect)) {
-                return { box: { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, type: 'svg-center-btn' } };
+            // Helper to read aria-label and title (Fixes JWPlayer invisible text)
+            const getElText = (el) => {
+              return (
+                el.innerText || el.textContent || 
+                el.getAttribute('aria-label') || el.getAttribute('title') || ''
+              ).toLowerCase().replace(/\s+/g, ' ').trim();
+            };
+
+            // Priority 1: Text / Aria-label buttons (Verify, Play, Continue)
+            for (const el of buttons) {
+              if (el.tagName === 'A') {
+                const href = el.getAttribute('href') || '';
+                if (href.startsWith('http') && !href.includes(window.location.hostname)) continue;
               }
-            }
-          }
-          
-          // Large, central empty buttons
-          let maxArea = 0;
-          let bestEmptyBtn = null;
-          for (const btn of buttons) {
-            const hasSvg = btn.querySelector('svg');
-            const text = (btn.innerText || '').trim();
-            if (text === '' && !hasSvg) {
-              const rect = btn.getBoundingClientRect();
-              const area = rect.width * rect.height;
-              if (rect.width >= 40 && rect.height >= 40 && isCenterish(rect)) {
-                if (area > maxArea) {
-                  maxArea = area;
-                  bestEmptyBtn = { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, type: 'empty-center-btn' };
+              const text = getElText(el);
+              if (text && (
+                text.includes('verify') || text.includes('play') || text.includes('continue') || 
+                text.includes('click') || text.includes('human') || text.includes('start') || text.includes('watch')
+              )) {
+                const rect = el.getBoundingClientRect();
+                if (rect.width > 10 && rect.height > 10) {
+                  return { box: { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, type: 'text-btn' } };
                 }
               }
             }
-          }
-          if (bestEmptyBtn) return { box: bestEmptyBtn };
 
-          return { box: null };
+            // Priority 2: JWPlayer / SVG Center Buttons
+            for (const btn of buttons) {
+              const hasSvg = btn.querySelector('svg');
+              const text = getElText(btn);
+              // Catch JWPlayer's specific display icon class
+              const isJwDisplay = btn.classList && btn.classList.contains('jw-icon-display');
+              
+              if ((hasSvg && text === '') || isJwDisplay) {
+                const rect = btn.getBoundingClientRect();
+                if (rect.width >= 24 && rect.height >= 24 && isCenterish(rect)) {
+                  return { box: { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, type: 'svg-center-btn' } };
+                }
+              }
+            }
+            
+            // Priority 3: Large Empty Center Buttons (CSS shapes)
+            let maxArea = 0;
+            let bestEmptyBtn = null;
+            for (const btn of buttons) {
+              const hasSvg = btn.querySelector('svg');
+              const text = getElText(btn);
+              if (text === '' && !hasSvg) {
+                const rect = btn.getBoundingClientRect();
+                const area = rect.width * rect.height;
+                if (rect.width >= 40 && rect.height >= 40 && isCenterish(rect)) {
+                  if (area > maxArea) {
+                    maxArea = area;
+                    bestEmptyBtn = { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, type: 'empty-center-btn' };
+                  }
+                }
+              }
+            }
+            if (bestEmptyBtn) return { box: bestEmptyBtn };
+
+            return { box: null };
+          }),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('evaluate timeout')), 3000))
+        ]).catch(e => {
+          return { box: null, error: e?.message };
         });
+
+        if (result?.error) {
+          log('[CLICK] Evaluate failed/timed out:', result.error);
+        }
 
         const box = result?.box ?? null;
 
@@ -99,50 +119,27 @@ export function startClickerLoop({ page, timeLeft, log }) {
           await page.mouse.click(box.x, box.y);
           log(`[CLICK] Clicked ${box.type} at`, { x: box.x, y: box.y });
           realClicks++;
-        } else if (realClicks === 0 && centerClicks < 3) {
-          // Fallback with probe
-          const probe = await page.evaluate(() => {
-            const cx = Math.round(window.innerWidth / 2);
-            const cy = Math.round(window.innerHeight / 2);
-            const el = document.elementFromPoint(cx, cy);
-            const info = { cx, cy, found: false, loading: false, tag: '', text: '' };
-            if (!el) return info;
-            info.found = true;
-            info.tag = el.tagName;
-            info.text = (el.innerText || '').trim().slice(0, 80);
-            info.cls = String(el.className || '').slice(0, 100);
-            const t = info.text.toLowerCase();
-            info.loading =
-              t.includes('loading') || t.includes('almost ready') ||
-              t.includes('optimizing') || t.includes('please wait') ||
-              t.includes('buffering') || t.includes('preparing') ||
-              t.includes('just a moment') || t.includes('stand by');
-            return info;
-          }).catch(() => null);
-
-          if (!probe || !probe.found) {
-            await page.mouse.click(640, 360);
-            centerClicks++;
-            log('[CLICK] Center fallback (no probe)');
-          } else if (probe.loading) {
-            log('[CLICK-PROBE] Loading state, skipping:', probe.text.replace(/\s+/g, ' '));
-          } else {
-            log('[CLICK-PROBE]', JSON.stringify(probe));
-            await page.mouse.click(probe.cx, probe.cy);
-            centerClicks++;
-            log('[CLICK] Clicked center fallback');
-          }
+        } else if (realClicks === 0 && blindClicks < 5) {
+          // If scanner finds nothing, keep poking the center to force ads to close
+          await page.mouse.click(640, 360);
+          blindClicks++;
+          log('[CLICK] Scanner found nothing, firing center fallback');
         }
+
       } catch (e) {
-        // Page might be navigating or closed
+        log('[CLICK ERROR]', e.message);
       }
-      
-      await new Promise(r => setTimeout(r, 2000)); 
+
+      await new Promise(r => setTimeout(r, 2000));
     }
+    log('[CLICK] Loop exited.');
   })();
 
   return {
     promise,
-    stop: () => { clicking = false; }
+    stop: () => { 
+      clicking = false; 
+      log('[CLICKER] Stop called.'); 
+    }
   };
 }

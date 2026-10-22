@@ -45,8 +45,8 @@ const PORT = process.env.PROXY_PORT || 3999;
 const DEFAULT_UA =
   process.env.UPSTREAM_UA ||
   (process.platform === 'linux'
-    ? 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.7922.47 Safari/537.36'
-    : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.7922.47 Safari/537.36');
+    ? 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.8059.79 Safari/537.36'
+    : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.8059.79 Safari/537.36');
 
 const ALLOWLIST = (process.env.ALLOWLIST || '')
   .split(',')
@@ -146,15 +146,38 @@ function isMasterPlaylist(lines) {
   return lines.some(ln => ln.startsWith('#EXT-X-STREAM-INF') || ln.startsWith('#EXT-X-MEDIA'));
 }
 
+// Double-encode a URL so it survives clients that percent-decode playlist URLs.
+// URLSearchParams encodes once; encodeURIComponent adds the second layer.
+function doubleEncode(url) {
+  return encodeURIComponent(url);
+}
+
+// Extract the real upstream URL from req.query.url.
+// Handles both compliant clients (still single-encoded) and
+// buggy clients that already decoded one layer.
+function extractFullUrl(req) {
+  let url = req.query.url?.toString() || '';
+
+  // If the scheme is still percent-encoded (https%3A%2F%2F),
+  // the client sent it as-is and we need to strip one more layer.
+  if (/^https?%3A%2F%2F/i.test(url)) {
+    try {
+      return decodeURIComponent(url);
+    } catch { /* fall through to raw value */ }
+  }
+
+  return url;
+}
+
 function buildSidPlaylistUrl(req, absoluteTargetUrl, sid) {
   const params = new URLSearchParams();
-  params.set('url', absoluteTargetUrl);
+  params.set('url', doubleEncode(absoluteTargetUrl));
   params.set('sid', sid);
 
   const q = req.query || {};
   const forwardList = [
     'ua', 'referer', 'origin', 'accept', 'accept_language', 'accept_encoding', 'authorization',
-    'idle', 'idle_ms',
+    'idle', 'idle_ms', 'proxy_ts',
   ];
 
   for (const k of forwardList) {
@@ -171,7 +194,7 @@ function buildSidPlaylistUrl(req, absoluteTargetUrl, sid) {
 
 function buildSidKeyUrl(req, absoluteKeyUrl, sid) {
   const params = new URLSearchParams();
-  params.set('url', absoluteKeyUrl);
+  params.set('url', doubleEncode(absoluteKeyUrl));
   params.set('sid', sid);
 
   const q = req.query || {};
@@ -179,6 +202,14 @@ function buildSidKeyUrl(req, absoluteKeyUrl, sid) {
   else if (q.idle != null && q.idle !== '') params.set('idle', String(q.idle));
 
   return `${req.protocol}://${req.get('host')}/key?${params.toString()}`;
+}
+
+function buildSidTsUrl(req, absoluteTsUrl, sid) {
+  const params = new URLSearchParams();
+  params.set('url', doubleEncode(absoluteTsUrl));
+  params.set('sid', sid);
+  // URLSearchParams automatically encodes '&' to '%26' and '?' to '%3F'
+  return `${req.protocol}://${req.get('host')}/ts?${params.toString()}`;
 }
 
 function rewriteMasterPlaylist(lines, baseUrl, req, sid) {
@@ -464,6 +495,11 @@ async function createSession({
 
   page.on('error', (e) => console.error('[PAGE_ERROR]', e));
   page.on('pageerror', (e) => console.error('[PAGE_PAGEERROR]', e));
+  // AUTO-DISMISS DIALOGS: Prevents alerts/confirms from freezing the CDP bridge
+  page.on('dialog', async (dialog) => {
+    log('[DIALOG] Dismissing:', dialog.type(), dialog.message().slice(0, 50));
+    try { await dialog.dismiss(); } catch {}
+  });
 
   await page.setUserAgent(ua || DEFAULT_UA);
   await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
@@ -483,6 +519,7 @@ async function createSession({
 
   const requestHandler = async (req) => {
     try {
+
       // Stop further segment/media requests after capture is complete.
       if (stopRequests) {
         return req.abort();
@@ -490,7 +527,16 @@ async function createSession({
 
       const urlStr = req.url();
 
-         // 1. Hard abort for junk, trackers, and broken domains
+      // DEBUG: Log headers for TS segments and tiktokcdn
+      // if (urlStr.includes('.ts') || urlStr.includes('tiktokcdn') || urlStr.includes('.m4s')) {
+      //   const headers = req.headers();
+      //   log(`\n========== TS REQUEST DEBUG ==========`);
+      //   log(`[TS URL] ${urlStr}`);
+      //   log(`[TS HEADERS]`, JSON.stringify(headers, null, 2));
+      //   log(`======================================\n`);
+      // }
+
+      // 1. Hard abort for junk, trackers, and broken domains
       if (
         urlStr.startsWith('data:') ||
         urlStr.startsWith('chrome:') ||
@@ -506,9 +552,19 @@ async function createSession({
         urlStr.includes('appsflyersdk.com') ||
         urlStr.includes('ndcertainlywhen.com') ||
         urlStr.includes('pwrgamerz.com') ||
-        urlStr.includes('usrpubtrk.com') ||
-        urlStr.includes('unwrapsstow') ||
-        urlStr.includes('kuronix.app')
+        urlStr.includes('pubtrk.com') ||
+        urlStr.includes('pubtrck.com') ||
+        urlStr.includes('unwrapsstow')  ||
+        urlStr.includes('aliepress')  ||
+        urlStr.includes('wallet')  ||
+        urlStr.includes('ustrk.com')  ||
+        urlStr.includes('budgetezy.org')  ||
+        urlStr.includes('gotrackier.com')  ||
+        urlStr.includes('adexchange')  ||
+        urlStr.includes('onlinegames')  ||
+        urlStr.includes('unlockyourfile')  ||
+        urlStr.includes('onepyrincehyarey.org')  ||
+        urlStr.includes('realintelligence360.com')
       ) {
         return req.abort();
       }
@@ -593,6 +649,19 @@ async function createSession({
       if (url.toLowerCase().includes('/verify') && !resolveOnly) {
         log('[RESP TEXT]', await res.text());
       }
+
+      // // ✅ DEBUG: Print headers and cookies for .ts segments
+      // if (url.includes('.ts') || url.includes('.m4s') || url.includes('/m/')) {
+      //   const headers = rq.headers();
+      //   const fileName = url.split('/').pop().split('?')[0];
+      //   log(`\n========== TS REQUEST DEBUG (${fileName}) ==========`);
+      //   log(`[TS URL] ${url}`);
+      //   log(`[TS REFERER] ${headers.referer || 'NONE'}`);
+      //   log(`[TS ORIGIN] ${headers.origin || 'NONE'}`);
+      //   log(`[TS COOKIES] ${headers.cookie || 'NONE'}`);
+      //   log(`[TS ALL HEADERS]`, headers); // Uncomment if you want to see everything
+      //   log(`====================================================\n`);
+      // }
 
       const ct = (res.headers()['content-type'] || '').toLowerCase();
 
@@ -854,7 +923,7 @@ app.get('/health/memory', (req, res) => {
 app.get('/playlist', async (req, res) => {
   try {
     const embedUrl = req.query.embed?.toString();
-    const playlistUrl = req.query.url?.toString();
+    const playlistUrl = extractFullUrl(req);
     const sid = req.query.sid?.toString();
 
     const isEmbedRequest = !!embedUrl && !sid;
@@ -1070,17 +1139,43 @@ app.get('/playlist', async (req, res) => {
       processed = rewriteMasterPlaylist(lines, baseUrl, req, sid);
     }
 
+    const proxyTs = isTruthy(req.query.proxy_ts);
+    const proxyHost = `${req.protocol}://${req.get('host')}`;
+
     const out = processed.map((line) => {
       if (!line || line.startsWith('#')) {
         if (line.startsWith('#EXT-X-KEY')) {
           return rewriteExtXKeyUriToProxy(line, baseUrl, req, sid);
         }
         if (line.startsWith('#EXT-X-MAP')) {
-          return absolutizeKeyOrMapUri(line, baseUrl);
+          const m = line.match(/URI="([^"]+)"/i);
+          if (m && m[1]) {
+            const abs = isAbsoluteUrl(m[1]) ? m[1] : toAbsolute(baseUrl, m[1]);
+            // Prevent double-proxying for MAP segments
+            if (abs.startsWith(proxyHost)) return line.replace(m[0], `URI="${abs}"`);
+            if (proxyTs) return line.replace(m[0], `URI="${buildSidTsUrl(req, abs, sid)}"`);
+            return line.replace(m[0], `URI="${abs}"`);
+          }
+          return line;
         }
         return line;
       }
-      return isAbsoluteUrl(line) ? line : toAbsolute(baseUrl, line);
+      
+      // Standard segment or variant playlist URI line
+      const abs = isAbsoluteUrl(line) ? line : toAbsolute(baseUrl, line);
+      
+      // If the URL is already pointing to our proxy 
+      // (e.g., a variant .m3u8 rewritten by rewriteMasterPlaylist), 
+      // DO NOT wrap it in /ts?url=. Just return it as is.
+      if (abs.startsWith(proxyHost)) {
+        return abs;
+      }
+
+      if (proxyTs) {
+        return buildSidTsUrl(req, abs, sid);
+      }
+      
+      return abs;
     });
 
     res.status(200)
@@ -1094,11 +1189,62 @@ app.get('/playlist', async (req, res) => {
   }
 });
 
+app.get('/ts', async (req, res) => {
+  try {
+    const sid = req.query.sid?.toString();
+    const tsUrl = extractFullUrl(req);
+    
+    if (!sid || !tsUrl) return res.status(400).send('Missing query param: sid and url');
+
+    const { session, status, message } = validateSession(sid);
+    if (!session) return res.status(status).send(message);
+    session.lastActivityAt = nowMs();
+
+    let upstream;
+    try {
+      upstream = await session.page.evaluate(async (u) => {
+        const r = await fetch(u, { cache: 'no-store', mode: 'cors' });
+        const buf = await r.arrayBuffer();
+        // Convert to Base64 to prevent CDP JSON serialization crashes on large files
+        const bytes = new Uint8Array(buf);
+        let binary = '';
+        for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+        return {
+          status: r.status,
+          headers: Object.fromEntries([...r.headers]),
+          base64: btoa(binary)
+        };
+      }, tsUrl);
+    } catch (err) {
+      return res.status(502).send('Upstream TS fetch failed: ' + (err?.message || String(err)));
+    }
+
+    if (!upstream) return res.status(502).send('Empty upstream TS response');
+    
+    if (upstream.status >= 400) {
+      return res.status(upstream.status)
+        .set('Cache-Control', 'no-store, must-revalidate')
+        .send(`Upstream TS returned error status: ${upstream.status}`);
+    }
+
+    const ct = upstream.headers?.['content-type'] || upstream.headers?.['Content-Type'] || 'video/mp2t';
+    const body = upstream.base64 ? Buffer.from(upstream.base64, 'base64') : Buffer.alloc(0);
+    
+    res.status(upstream.status || 200)
+      .set('Cache-Control', 'no-store, must-revalidate')
+      .set('Content-Type', ct)
+      .send(body);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('TS proxy error: ' + (err?.message || String(err)));
+  }
+});
+
 // For AES key uri rewriting
 app.get('/key', async (req, res) => {
   try {
     const sid = req.query.sid?.toString();
-    const keyUrl = req.query.url?.toString();
+    const keyUrl = extractFullUrl(req);
     
     if (!sid || !keyUrl) {
       res.status(400).send('Missing query param: sid and url');
