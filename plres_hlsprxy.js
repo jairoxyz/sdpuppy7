@@ -5,6 +5,7 @@ import dns from 'node:dns';
 import { URL } from 'node:url';
 import crypto from 'node:crypto';
 import { startClickerLoop } from './clicker.js';
+import { handleDaddyliveToken, handleDaddylivePlaylist, handleWaterera } from './daddylive.js';
 
 // CloakBrowser import (drop-in Puppeteer replacement)
 //import { launch } from 'cloakbrowser/puppeteer';
@@ -54,27 +55,28 @@ const ALLOWLIST = (process.env.ALLOWLIST || '')
   .filter(Boolean);
 
 let ALLOWED_HOSTS = new Set([
-  'streamed.*',
-  'embedsports.*',
-  'embedsporty.*',
-  'embedstreams.*',
-  'embed.st',
-  'embedhd.st',
-  'strmd.*',
-  'poocloud.*',
-  'pooembed.*',
-  'embedindia.*',
-  'modifiles.*',
-  'vidfast.*',
-  'ppv.*',
-  'embed.ppv.*',
-  '111movies.*',
-  'hexa.*',
-  'flixer.*',
-  'dlstreams.*',
-  'vidcore.*',
-  'gn1r5n.org',
-  'nxhsa.*'
+  // 'streamed.*',
+  // 'embedsports.*',
+  // 'embedsporty.*',
+  // 'embedstreams.*',
+  // 'embed.st',
+  // 'embedhd.st',
+  // 'strmd.*',
+  // 'poocloud.*',
+  // 'pooembed.*',
+  // 'embedindia.*',
+  // 'modifiles.*',
+  // 'vidfast.*',
+  // 'ppv.*',
+  // 'embed.ppv.*',
+  // '111movies.*',
+  // 'hexa.*',
+  // 'flixer.*',
+  // 'dlstreams.*',
+  // 'vidcore.*',
+  // 'gn1r5n.org',
+  // 'nxhsa.*',
+  // 'taifood-blog.*'
 ]);
 
 function hostMatchesAllowed(host) {
@@ -305,6 +307,7 @@ class BrowserManager {
     this.browser = null;
     this.xvfbsession = null;
     this._launchPromise = null;
+    this.activeTasks = 0;
   }
 
   // SAFE FALLBACK: Only starts Xvfb if not already running
@@ -363,6 +366,8 @@ class BrowserManager {
         const headless = process.platform === 'linux' ? false : false;
         if (!headless) this.ensureXvfb();
 
+        const fingerprintSeed = `cf-default.toString('base64').slice(0, 16)}`;
+
         // Launch with working-script settings
         this.browser = await (await import('cloakbrowser/puppeteer')).launch({
           headless,
@@ -374,11 +379,20 @@ class BrowserManager {
             '--no-sandbox',
             '--disable-setuid-sandbox',
             '--disable-dev-shm-usage',
-            '--disable-gpu',
-            '-window-size=1280,720',
-            '--fingerprint=12345',  // Fixed fingerprint prevents conflicts
+            //'--disable-gpu',
+            '--window-size=1280,720',
+            `--fingerprint=${fingerprintSeed}`,
+            '--fingerprint-noise=false',
+            '--use-gl=angle',          // Force ANGLE graphics backend
+            '--use-angle=swiftshader', // Use SwiftShader for software WebGL rendering
+            '--enable-webgl',
+            '--disable-gpu-rasterization', // Speeds up software rendering in SwiftShader
+            '--disable-gpu-driver-bug-workarounds', // Reduces WebGL initialization overhead
             '--autoplay-policy=no-user-gesture-required', // Allow autoplay without click
           ],
+          launchOptions: {
+            slowMo: 30, // Subtle delay between CDP commands (ms)
+          },
           defaultViewport: { width: 1280, height: 720 },
         });
 
@@ -451,7 +465,7 @@ class BrowserManager {
 const browserMgr = new BrowserManager();
 
 async function maybeCloseBrowserIfIdle() {
-  if (SESSIONS.size === 0 && browserMgr.browser) {
+  if (SESSIONS.size === 0 && browserMgr.activeTasks === 0 && browserMgr.browser) {
     await browserMgr.forceClose();
     log('[BROWSER] Closed (no active sessions)');
   }
@@ -905,7 +919,6 @@ app.use((req, res, next) => {
 });
 
 app.get('/health', (_req, res) => res.status(200).send('ok'));
-
 app.get('/health/memory', (req, res) => {
   const mem = process.memoryUsage();
   res.json({
@@ -919,6 +932,11 @@ app.get('/health/memory', (req, res) => {
     uptime: process.uptime(),
   });
 });
+
+app.get('/daddylive/token', (req, res) => handleDaddyliveToken(req, res, browserMgr));
+app.get('/daddylive/playlist', (req, res) => handleDaddylivePlaylist(req, res, browserMgr));
+
+app.get('/daddylive/waterera', (req, res) => handleWaterera(req, res, browserMgr));
 
 app.get('/playlist', async (req, res) => {
   try {

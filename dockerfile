@@ -81,6 +81,10 @@ COPY --chown=node:node . .
 RUN npm install && \
     npm prune --production
 
+# Trigger impers native libcurl resolution/download during image build
+RUN node --input-type=module \
+    -e "import('impers').then(() => console.log('impers native library loaded'))"
+
 # Expose app port binding
 # EXPOSE ${PORT} ${PROXY_PORT}
 EXPOSE ${PROXY_PORT}

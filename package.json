@@ -1,6 +1,6 @@
 {
   "name": "sdpuppy7",
-  "version": "3.0.9",
+  "version": "3.0.10",
   "type": "module",
   "description": "",
   "main": "plresolver.js",
@@ -12,10 +12,10 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "cloakbrowser": "^0.6.3",
+    "cloakbrowser": "^0.6.5",
     "express": "^5.2.1",
-    "puppeteer-core": "^25.14.0",
-    "undici": "^7.18.2",
+    "impers": "^0.1.3",
+    "puppeteer-core": "^25.17.0",
     "xvfb": "^0.4.0"
   },
   "devDependencies": {
