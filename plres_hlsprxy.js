@@ -382,7 +382,7 @@ class BrowserManager {
             //'--disable-gpu',
             '--window-size=1280,720',
             `--fingerprint=${fingerprintSeed}`,
-            '--fingerprint-noise=false',
+            '--fingerprint-noise=false', // workaround for https://github.com/CloakHQ/CloakBrowser/issues/646
             '--use-gl=angle',          // Force ANGLE graphics backend
             '--use-angle=swiftshader', // Use SwiftShader for software WebGL rendering
             '--enable-webgl',
@@ -933,6 +933,7 @@ app.get('/health/memory', (req, res) => {
   });
 });
 
+// -------------- DaddyLive endpoints ---------------
 app.get('/daddylive/token', (req, res) => handleDaddyliveToken(req, res, browserMgr));
 app.get('/daddylive/playlist', (req, res) => handleDaddylivePlaylist(req, res, browserMgr));
 

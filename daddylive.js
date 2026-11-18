@@ -116,7 +116,7 @@ function decodeBase64ChunkShuffle(_0x2d612d) {
 }
 
 // ============================================================================
-// 3. Turnstile Solver (ONLY browser usage)
+// 3. Turnstile Solver 
 // ============================================================================
 async function solveTurnstileMin(browserMgr, url, siteKey, action='') {
     browserMgr.activeTasks = (browserMgr.activeTasks || 0) + 1;
@@ -174,6 +174,8 @@ async function solveTurnstileMin(browserMgr, url, siteKey, action='') {
         console.log('[TURNSTILE] Waiting for turnstile token...');
         const timeoutMs = 30000;
         let token = null;
+
+        await new Promise((r) => setTimeout(r, 1500)); 
         
         try {
             const tokenEl = await page.waitForFunction(
@@ -206,6 +208,8 @@ async function solveTurnstileMin(browserMgr, url, siteKey, action='') {
 
 // ============================================================================
 // ENDPOINT 1: /daddylive/token
+// to get CFTS token, ticket and playlist url: 
+// ?embed_url=https://dembed.st/premiumtv/daddy.php?id=303&ref=https://thedaddy.li/
 // ============================================================================
 export async function handleDaddyliveToken(req, res, browserMgr) {
     browserMgr.activeTasks = (browserMgr.activeTasks || 0) + 1;
@@ -323,7 +327,9 @@ export async function handleDaddyliveToken(req, res, browserMgr) {
             });
         } 
         // ==========================================================================
-        // PATH B: TOKEN REFRESH (No browser, just impers HTTP/2)
+        // PATH B: TOKEN REFRESH 
+        // to refresh token based on ttl
+        // ?embed_url=https://dembed.st/...&ticket=...&playlist_url=...
         // ==========================================================================
         else if (playlist_url && ticket && embed_url) {
             console.log('[DADDYLIVE/TOKEN] Received token refresh request for:', playlist_url);
@@ -367,7 +373,9 @@ export async function handleDaddyliveToken(req, res, browserMgr) {
 }
 
 // ============================================================================
-// ENDPOINT 2: /daddylive/playlist (No browser, just impers HTTP/2)
+// ENDPOINT 2: /daddylive/playlist
+// To proxy playlist
+// ?embed_url=https://dembed.st/...&token=...&playlist_url=...&k=...
 // ============================================================================
 export async function handleDaddylivePlaylist(req, res, browserMgr) {
     
@@ -408,7 +416,9 @@ export async function handleDaddylivePlaylist(req, res, browserMgr) {
 }
 
 // ============================================================================
-// ENDPOINT 3: /turnstile/solve (Generic Turnstile Solver)
+// ENDPOINT 3: /daddylive/waterera 
+// To get and proxy playlist, send cfts after first call
+// ?url=https://waterera.net/e/03pax86wzf579&token=...
 // ============================================================================
 export async function handleWaterera(req, res, browserMgr) {
     try {
