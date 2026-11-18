@@ -422,21 +422,52 @@ export async function handleDaddylivePlaylist(req, res, browserMgr) {
 // ============================================================================
 export async function handleWaterera(req, res, browserMgr) {
     try {
-        // Extract 'token' from query args (this is the cf turnstile token)
-        const { url, token: providedToken, ref } = req.query;
-
+        // 'url' is ALWAYS required to derive the correct Referer and Origin headers
+        const { url, playlist_url, token: providedToken } = req.query;
+        
         if (!url) {
             return res.status(400).json({ ok: false, error: 'Missing required parameter: url' });
         }
-        console.log('[DADDYLIVE/WATERERA] Request received for:', url);
 
-        const org = new URL(url).origin;
+        const ua = req.query.ua || DEFAULT_UA;
+        const embedOrg = new URL(url).origin; // Always derive Origin from the embed URL
+        const ref = req.query.ref || "https://thedaddy.li/";
 
+        // ==========================================================================
+        // FAST PATH: Playlist Refresh (playlist_url provided, skip Turnstile/Exchange)
+        // ==========================================================================
+        if (playlist_url) {
+            console.log('[WATERERA] Fetching playlist from:', playlist_url);
+            
+            const plRes = await fetch(playlist_url, {
+                method: "GET",
+                headers: {
+                    "User-Agent": ua,
+                    'Referer': `${embedOrg}/`, 
+                    'Origin': embedOrg,
+                }
+            });
+            
+            if (!plRes.ok) throw new Error(`Playlist refresh failed: ${plRes.status}`);
+            const playlistText = await plRes.text();
+
+            return res.json({ 
+                ok: true, 
+                playlist_url: playlist_url,
+                playlist_text: playlistText 
+            });
+        }
+
+        // ==========================================================================
+        // SLOW PATH: Full Initialization (No playlist_url, must solve and exchange)
+        // ==========================================================================
+        console.log('[WATERERA] Full init request received for:', url);
+        
         const htmlRes = await fetch(url, {
             method: "GET",
             headers: {
-                "User-Agent": req.query.ua || DEFAULT_UA,
-                "Referer": req.query.ref || "https://thedaddy.li/",
+                "User-Agent": ua,
+                "Referer": ref,
             }
         });
         
@@ -448,37 +479,35 @@ export async function handleWaterera(req, res, browserMgr) {
         if (!match) throw new Error('Failed to extract econf from HTML');
         
         const result = match[1];
-        // Assuming decodeBase64ChunkShuffle is defined elsewhere in your file
         const econf = decodeBase64ChunkShuffle(result); 
         
         let streamUrl = econf.stream_url;
         let finalToken = providedToken;
 
-        // Handle Turnstile if a key exists in the config
         if (econf.turnstile_key) {
-            // 1. Solve Turnstile ONLY if a token wasn't provided in the request
             if (!finalToken) {
-                console.log(`[DADDYLIVE/WATERERA] Solving Turnstile for: ${url}`);
+                console.log(`[WATERERA] Solving Turnstile for: ${url}`);
                 finalToken = await solveTurnstileMin(browserMgr, url, econf.turnstile_key);
             } else {
-                console.log(`[DADDYLIVE/WATERERA] Using provided Turnstile token, skipping solve.`);
+                console.log(`[WATERERA] Using provided Turnstile token, skipping solve.`);
             }
 
-            // 2. Exchange token for stream_url
             const payload = new URLSearchParams({
                 hash: econf.turnstile_hash,
                 token: finalToken,
                 ts: econf.ts
             });
 
-            console.log('[DADDYLIVE/WATERERA] Exchanging token for stream URL...');
+            console.log('[WATERERA] Exchanging token for stream URL...');
             const turnstileRes = await fetch(url.replace('/e/', '/turnstile/'), {
                 method: 'POST',
                 headers: {
-                    'User-Agent': req.query.ua || DEFAULT_UA,
+                    'User-Agent': ua,
+                    'Referer': `${embedOrg}/`,
+                    'Origin': embedOrg,
                     'Content-Type': 'application/x-www-form-urlencoded',
                 },
-                body: payload.toString() // Properly URL-encoded
+                body: payload.toString()
             });
 
             if (!turnstileRes.ok) {
@@ -491,33 +520,32 @@ export async function handleWaterera(req, res, browserMgr) {
         }
 
         if (!streamUrl) {
-            throw new Error('Failed to obtain stream URL from econf or turnstile exchange');
+            throw new Error('Failed to obtain stream URL');
         }
 
-        // 3. Fetch the actual playlist content via standard fetch (as confirmed working)
-        console.log('[DADDYLIVE/WATERERA] Fetching playlist content...');
+        console.log('[WATERERA] Fetching initial playlist content from:', streamUrl);
         const plRes = await fetch(streamUrl, {
             method: "GET",
             headers: {
-                "User-Agent": req.query.ua || DEFAULT_UA,
-                'Referer': `${org}/`,
-                'Origin': org,
+                "User-Agent": ua,
+                'Referer': `${embedOrg}/`,
+                'Origin': embedOrg,
             }
         });
         
-        if (!plRes.ok) throw new Error(`Playlist fetch failed: ${plRes.status}`);
+        if (!plRes.ok) throw new Error(`Initial playlist fetch failed: ${plRes.status}`);
         const playlistText = await plRes.text();
 
-        // 4. Return the token (for client-side caching/reuse) AND the fetched playlist content
+        // Return playlist_url (streamUrl) so the client can cache it for the Fast Path
         res.json({ 
             ok: true, 
             token: finalToken,
-            stream_url: streamUrl,
+            playlist_url: streamUrl, 
             playlist_text: playlistText 
         });
         
     } catch (err) {
-        console.error('[DADDYLIVE/WATERERA] Error:', err.message);
+        console.error('[WATERERA] Error:', err.message);
         res.status(500).json({ ok: false, error: err.message });
     }
 }
