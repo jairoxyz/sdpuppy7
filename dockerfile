@@ -71,7 +71,8 @@ ENV HOME=/home/node \
     NODE_ENV=production \
     PROXY_PORT=${PROXY_PORT} \
     CLOAKBROWSER_CACHE_DIR=/home/node/.cloakbrowser \
-    CLOAKBROWSER_AUTO_UPDATE=false
+    CLOAKBROWSER_AUTO_UPDATE=false \
+    CLOAKBROWSER_SUPPRESS_FONT_WARNING=1
 
 # Bundle app source and chown to non root
 COPY --chown=node:node . .

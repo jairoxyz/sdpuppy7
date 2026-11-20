@@ -6,6 +6,20 @@ import { get as impersGet, post as impersPost } from 'impers';
 const PROOF_KEY_HEX = "b7fec5f0095bed75e5ef5f5222a732a41343b1ebb65f6490d926eaf7538b3137";
 const DEFAULT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36";
 
+// --- Logging ---
+const LOG_ENABLED = 
+  (process.env.LOG ?? process.env.DEBUG ?? '').toString().trim().toLowerCase();
+
+const DEFAULT_LOG_ON =
+  LOG_ENABLED === '1' || LOG_ENABLED === 'true' || LOG_ENABLED === 'yes' || LOG_ENABLED === 'on';
+
+function log(...args) {
+  if (DEFAULT_LOG_ON) console.log(...args);
+}
+function infoLog(...args) {
+  console.log(...args);
+}
+
 // ============================================================================
 // 1. Regex Extraction
 // ============================================================================
@@ -171,7 +185,7 @@ async function solveTurnstileMin(browserMgr, url, siteKey, action='') {
 
         await page.goto(url, { waitUntil: "domcontentloaded" });
         
-        console.log('[TURNSTILE] Waiting for turnstile token...');
+        log('[TURNSTILE] Waiting for turnstile token...');
         const timeoutMs = 30000;
         let token = null;
 
@@ -187,14 +201,14 @@ async function solveTurnstileMin(browserMgr, url, siteKey, action='') {
             );
             token = tokenEl ? await page.evaluate(el => el.value, tokenEl) : null;
         } catch (err) {
-            console.log('[TURNSTILE] Auto-solve timed out.');
+            infoLog('[TURNSTILE] Auto-solve timed out.');
         }
 
         if (!token || token.length < 10) {
             throw new Error("Failed to get token");
         }
         
-        console.log('[TURNSTILE] ✓ Token solved successfully.');
+        infoLog('[TURNSTILE] ✓ Token solved successfully.');
         return token;
 
     } catch (e) {
@@ -221,7 +235,7 @@ export async function handleDaddyliveToken(req, res, browserMgr) {
         // PATH A: FULL INIT
         // ==========================================================================
         if (embed_url && !playlist_url && !ticket) {
-            console.log('[DADDYLIVE/TOKEN] Token request received for:', embed_url);
+            infoLog('[DADDYLIVE/TOKEN] Token request received for:', embed_url);
             const ua = req.query.ua || DEFAULT_UA;
             const edgeOrigin = new URL(embed_url).origin;
 
@@ -247,7 +261,7 @@ export async function handleDaddyliveToken(req, res, browserMgr) {
             // 3. Solve Turnstile (Browser)
             let turnstileToken = null;
             if (data.tsite) {
-                console.log('[DADDYLIVE/TOKEN] Solving CF Turnstile ...');
+                log('[DADDYLIVE/TOKEN] Solving CF Turnstile ...');
                 turnstileToken = await solveTurnstileMin(browserMgr, embed_url, data.tsite, 'watch');
             }
 
@@ -262,7 +276,7 @@ export async function handleDaddyliveToken(req, res, browserMgr) {
             });
             if (turnstileToken) ticketPayload.append('cf-turnstile-response', turnstileToken);
 
-            console.log('[DADDYLIVE/TOKEN] Fetching edge ticket ...');
+            log('[DADDYLIVE/TOKEN] Fetching edge ticket ...');
             const ticketRes = await fetch(embed_url, {
                 method: 'POST',
                 headers: {
@@ -281,7 +295,7 @@ export async function handleDaddyliveToken(req, res, browserMgr) {
 
             // 5. Get Token from Edge via impers (default HTTP/2)
             const tokenUrl = `${data.edge}/api/playlist-token?slug=${encodeURIComponent(data.channel)}&tk=${encodeURIComponent(newTicket)}`;
-            console.log('[DADDYLIVE/TOKEN] Fetching playlist token ...');
+            log('[DADDYLIVE/TOKEN] Fetching playlist token ...');
             
             const tokenRes = await impersGet(tokenUrl, {
                 headers: {
@@ -323,6 +337,7 @@ export async function handleDaddyliveToken(req, res, browserMgr) {
                 token: tokenData.token,
                 k: tokenData.k,
                 ttl: tokenData.ttl || 120,
+                embed_url: embed_url,
                 //playlist_text: cleanPlaylist
             });
         } 
@@ -332,7 +347,7 @@ export async function handleDaddyliveToken(req, res, browserMgr) {
         // ?embed_url=https://dembed.st/...&ticket=...&playlist_url=...
         // ==========================================================================
         else if (playlist_url && ticket && embed_url) {
-            console.log('[DADDYLIVE/TOKEN] Received token refresh request for:', playlist_url);
+            infoLog('[DADDYLIVE/TOKEN] Received token refresh request for:', playlist_url);
             const pUrl = new URL(playlist_url);
             const edgeDomain = `${pUrl.protocol}//${pUrl.host}`;
             const pathParts = pUrl.pathname.split('/').filter(Boolean);
@@ -386,7 +401,7 @@ export async function handleDaddylivePlaylist(req, res, browserMgr) {
         if (!embed_url || !playlist_url || !token || !k) {
             return res.status(400).json({ ok: false, error: 'Missing parameters' });
         }
-        console.log('[DADDYLIVE/PLAYLIST] Received playlist request for:', playlist_url);
+        infoLog('[DADDYLIVE/PLAYLIST] Received playlist request for:', playlist_url);
         const ua = req.query.ua || DEFAULT_UA;
         const edgeOrigin = new URL(embed_url).origin;
         const cleanUrl = playlist_url.split('?')[0];
@@ -437,7 +452,7 @@ export async function handleWaterera(req, res, browserMgr) {
         // FAST PATH: Playlist Refresh (playlist_url provided, skip Turnstile/Exchange)
         // ==========================================================================
         if (playlist_url) {
-            console.log('[WATERERA] Fetching playlist from:', playlist_url);
+            log('[WATERERA] Reloading playlist from:', playlist_url);
             
             const plRes = await fetch(playlist_url, {
                 method: "GET",
@@ -461,7 +476,7 @@ export async function handleWaterera(req, res, browserMgr) {
         // ==========================================================================
         // SLOW PATH: Full Initialization (No playlist_url, must solve and exchange)
         // ==========================================================================
-        console.log('[WATERERA] Full init request received for:', url);
+        infoLog('[WATERERA] Request received for:', url);
         
         const htmlRes = await fetch(url, {
             method: "GET",
@@ -486,10 +501,10 @@ export async function handleWaterera(req, res, browserMgr) {
 
         if (econf.turnstile_key) {
             if (!finalToken) {
-                console.log(`[WATERERA] Solving Turnstile for: ${url}`);
+                log(`[WATERERA] Solving Turnstile for: ${url}`);
                 finalToken = await solveTurnstileMin(browserMgr, url, econf.turnstile_key);
             } else {
-                console.log(`[WATERERA] Using provided Turnstile token, skipping solve.`);
+                log(`[WATERERA] Using provided Turnstile token, skipping solve.`);
             }
 
             const payload = new URLSearchParams({
@@ -498,7 +513,7 @@ export async function handleWaterera(req, res, browserMgr) {
                 ts: econf.ts
             });
 
-            console.log('[WATERERA] Exchanging token for stream URL...');
+            log('[WATERERA] Exchanging token for stream URL...');
             const turnstileRes = await fetch(url.replace('/e/', '/turnstile/'), {
                 method: 'POST',
                 headers: {
@@ -523,7 +538,7 @@ export async function handleWaterera(req, res, browserMgr) {
             throw new Error('Failed to obtain stream URL');
         }
 
-        console.log('[WATERERA] Fetching initial playlist content from:', streamUrl);
+        log('[WATERERA] Fetching playlist content from:', streamUrl);
         const plRes = await fetch(streamUrl, {
             method: "GET",
             headers: {

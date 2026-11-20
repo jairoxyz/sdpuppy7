@@ -964,6 +964,46 @@ app.get('/playlist', async (req, res) => {
     const referer = req.query.referer?.toString() || process.env.UPSTREAM_REFERER || '';
     const origin = req.query.origin?.toString() || process.env.UPSTREAM_ORIGIN || '';
 
+    // ==========================================================================
+    // DADDYLIVE INTERCEPT
+    // ==========================================================================
+    const isDaddylive = isTruthy(req.query.isDaddyPlayer);
+    
+    if (isDaddylive && isEmbedRequest) {
+        let finalEmbedUrl = embedUrl;
+        infoLog('[APP] Daddylive player page detected:', embedUrl);
+        try {
+            const playerRes = await fetch(embedUrl, {
+                headers: { 'User-Agent': ua, 'Referer': referer, 'Origin': origin }
+            });
+            if (!playerRes.ok) {
+                return res.status(playerRes.status).send(`Failed to fetch player page: ${playerRes.status}`);
+            }
+            const playerHtml = await playerRes.text();
+            const iframeMatch = playerHtml.match(/<iframe[^>]+src=["']([^"']+)["'][^>]*>/i);
+            if (!iframeMatch || !iframeMatch[1]) {
+                return res.status(400).send('Failed to extract iframe src from player page');
+            }
+            finalEmbedUrl = iframeMatch[1];
+            
+            log('[APP] Successfully extracted embed URL:', finalEmbedUrl);
+        } catch (err) {
+            return res.status(500).send('Error extracting player page: ' + err.message);
+        }
+        // 2. Map ONLY the needed parameters exactly as requested
+        const daddyReq = {
+            query: {
+                embed_url: finalEmbedUrl,
+                ua: ua,
+                ref: referer,
+            }
+        };
+        // 3. Route to Daddylive Token handler and RETURN immediately.
+        // handleDaddyliveToken will send the response (res.json) back to the client.
+        return await handleDaddyliveToken(daddyReq, res, browserMgr);
+    }  
+    // ========================================================================
+
     if (isEmbedRequest) {
       const resolveOnly = isTruthy(req.query.resolve_only);
       const useClicker = isTruthy(req.query.clicker);
